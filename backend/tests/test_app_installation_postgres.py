@@ -18,6 +18,7 @@ from app.exceptions import ConflictError, ForbiddenError
 from app.services import app_installation_service as installation
 from app.services import app_resource_service as resources
 from app.services import app_rollout_service as rollout
+from app.services import app_rollout_worker as worker
 from app.services import access_service
 from app.services.app_identity_service import AppPrincipal
 from app.services.auth_service import AuthenticatedUser
@@ -31,6 +32,9 @@ _MIGRATIONS = [
     _BACKEND / "app" / "db" / "migrations" / "047_app_registry.py",
     _BACKEND / "app" / "db" / "migrations" / "051_app_credentials.py",
     _BACKEND / "app" / "db" / "migrations" / "052_app_inventory.py",
+    _BACKEND / "app" / "db" / "migrations" / "062_app_rollout.py",
+    _BACKEND / "app" / "db" / "migrations" / "073_app_rollout_resume.py",
+    _BACKEND / "app" / "db" / "migrations" / "086_dynamic_table_rows_changed.py",
     _BACKEND / "app" / "db" / "migrations" / "095_app_release_manifest_v2.py",
 ]
 _DSN = os.environ.get(
@@ -175,7 +179,7 @@ async def _command(pool, app_id, vault_id, release_id, *, mode="install", capabi
         app_id,
         vault_id,
         release_id=release_id,
-        capabilities=capabilities or ["installation:read", "inventory:read"],
+        capabilities=capabilities or ["installation:read"],
         mode=mode,
         user=_admin(),
         correlation_id=str(uuid.uuid4()),
@@ -247,6 +251,208 @@ async def test_install_replays_sequentially_and_concurrently(lifecycle_pool):
             "SELECT count(*) FROM installation_grants WHERE installation_id = $1",
             uuid.UUID(first["installation_id"]),
         ) == 1
+        assert await conn.fetchval(
+            "SELECT count(*) FROM app_rollout_jobs AS job JOIN app_rollout_targets AS target ON target.job_id = job.id WHERE job.app_id = $1 AND target.installation_id = $2",
+            app_id,
+            uuid.UUID(first["installation_id"]),
+        ) == 1
+        assert await conn.fetchval(
+            "SELECT count(*) FROM app_rollout_jobs AS job JOIN app_rollout_targets AS target ON target.job_id = job.id WHERE job.app_id = $1 AND target.installation_id = $2 AND job.requested_by_kind = 'admin'",
+            app_id,
+            uuid.UUID(first["installation_id"]),
+        ) == 1
+
+
+async def test_install_creates_one_durable_target_and_worker_applies_it(
+    monkeypatch, lifecycle_pool
+):
+    monkeypatch.setattr(worker, "get_pool", lambda: lifecycle_pool)
+
+    class _RoleSync:
+        async def grant_table_in_conn(self, *_args):
+            return None
+
+    monkeypatch.setattr(worker, "get_role_sync", lambda: _RoleSync())
+    app_id = await _app(lifecycle_pool, "install-worker")
+    release_id = await _release(lifecycle_pool, app_id, "1.0.0")
+    vault_a = await _vault(lifecycle_pool, "install-worker-a")
+    vault_b = await _vault(lifecycle_pool, "install-worker-b")
+
+    first = await _command(lifecycle_pool, app_id, vault_a, release_id)
+    first_replay = await _command(lifecycle_pool, app_id, vault_a, release_id)
+    second = await _command(lifecycle_pool, app_id, vault_b, release_id)
+    second_replay = await _command(lifecycle_pool, app_id, vault_b, release_id)
+
+    assert first["lifecycle"] == second["lifecycle"] == "installing"
+    assert first_replay["replayed"] is True
+    assert second_replay["replayed"] is True
+    async with lifecycle_pool.acquire() as conn:
+        jobs = await conn.fetch(
+            """
+            SELECT job.id, job.status, target.installation_id, target.vault_id
+              FROM app_rollout_jobs AS job
+              JOIN app_rollout_targets AS target ON target.job_id = job.id
+             WHERE job.app_id = $1
+             ORDER BY target.vault_id
+            """,
+            app_id,
+        )
+        grants = await conn.fetch(
+            """
+            SELECT installation.id AS installation_id, grant_row.capabilities
+              FROM vault_app_installations AS installation
+              JOIN installation_grants AS grant_row
+                ON grant_row.installation_id = installation.id
+             WHERE installation.app_id = $1
+             ORDER BY installation.id
+            """,
+            app_id,
+        )
+    assert len(jobs) == 2
+    assert len(grants) == 2
+    assert all(row["capabilities"] == ["installation:read"] for row in grants)
+    assert {row["installation_id"] for row in jobs} == {
+        uuid.UUID(first["installation_id"]),
+        uuid.UUID(second["installation_id"]),
+    }
+    assert {row["vault_id"] for row in jobs} == {vault_a, vault_b}
+    assert {row["status"] for row in jobs} == {"pending"}
+    async with lifecycle_pool.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT count(*) FROM app_rollout_jobs WHERE app_id = $1 AND requested_by_kind = 'admin'",
+            app_id,
+        ) == 2
+
+    await worker.run_once()
+    await worker.run_once()
+    async with lifecycle_pool.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT count(*) FROM app_rollout_jobs WHERE app_id = $1 AND status = 'applied'",
+            app_id,
+        ) == 2
+        assert await conn.fetchval(
+            "SELECT count(*) FROM vault_app_installations WHERE app_id = $1 AND lifecycle = 'active'",
+            app_id,
+        ) == 2
+
+
+async def test_fresh_install_queues_one_target_and_worker_applies_it(
+    monkeypatch, lifecycle_pool
+):
+    monkeypatch.setattr(worker, "get_pool", lambda: lifecycle_pool)
+    app_id = await _app(lifecycle_pool, "fresh-worker")
+    release_id = await _release(lifecycle_pool, app_id, "2.0.0")
+    vault_id = await _vault(lifecycle_pool, "fresh-worker")
+    async with lifecycle_pool.acquire() as conn:
+        installation_id = await conn.fetchval(
+            "INSERT INTO vault_app_installations(app_id,vault_id,lifecycle) VALUES($1,$2,'uninstalled') RETURNING id",
+            app_id,
+            vault_id,
+        )
+
+    fresh = await _command(
+        lifecycle_pool,
+        app_id,
+        vault_id,
+        release_id,
+        mode="fresh",
+    )
+    replay = await _command(
+        lifecycle_pool,
+        app_id,
+        vault_id,
+        release_id,
+        mode="fresh",
+    )
+    assert fresh["command_status"] == "accepted"
+    assert fresh["replayed"] is False
+    assert fresh["lifecycle"] == "installing"
+    assert replay["command_status"] == "already_applied"
+    assert replay["replayed"] is True
+
+    async with lifecycle_pool.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT count(*) FROM app_rollout_jobs AS job JOIN app_rollout_targets AS target ON target.job_id=job.id WHERE job.app_id=$1 AND target.installation_id=$2 AND job.release_id=$3 AND job.requested_by_kind='admin'",
+            app_id,
+            installation_id,
+            release_id,
+        ) == 1
+
+    for _ in range(3):
+        await worker.run_once()
+
+    async with lifecycle_pool.acquire() as conn:
+        state = await conn.fetchrow(
+            "SELECT lifecycle,current_release_id,desired_release_id FROM vault_app_installations WHERE id=$1",
+            installation_id,
+        )
+        assert await conn.fetchval(
+            "SELECT status FROM app_rollout_jobs WHERE app_id=$1 AND release_id=$2",
+            app_id,
+            release_id,
+        ) == "applied"
+    assert state["lifecycle"] == "active"
+    assert state["current_release_id"] == release_id
+    assert state["desired_release_id"] == release_id
+
+
+async def test_install_rollout_queue_failure_rolls_back_command(
+    monkeypatch, lifecycle_pool
+):
+    app_id = await _app(lifecycle_pool, "install-rollback")
+    release_id = await _release(lifecycle_pool, app_id, "1.0.0")
+    vault_id = await _vault(lifecycle_pool, "install-rollback")
+
+    async def fail_queue(*_args, **_kwargs):
+        raise ConflictError("Simulated durable job insertion failure")
+
+    monkeypatch.setattr(rollout, "enqueue_installation_rollout", fail_queue)
+
+    with pytest.raises(ConflictError, match="Simulated durable job insertion failure"):
+        await _command(lifecycle_pool, app_id, vault_id, release_id)
+
+    async with lifecycle_pool.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT count(*) FROM vault_app_installations WHERE app_id=$1 AND vault_id=$2",
+            app_id,
+            vault_id,
+        ) == 0
+        assert await conn.fetchval(
+            "SELECT count(*) FROM installation_grants AS grant_row JOIN vault_app_installations AS installation ON installation.id=grant_row.installation_id WHERE installation.app_id=$1 AND installation.vault_id=$2",
+            app_id,
+            vault_id,
+        ) == 0
+        assert await conn.fetchval(
+            "SELECT count(*) FROM app_rollout_jobs WHERE app_id=$1",
+            app_id,
+        ) == 0
+
+
+async def test_install_cannot_be_accepted_when_queue_returns_no_job(
+    monkeypatch, lifecycle_pool
+):
+    app_id = await _app(lifecycle_pool, "install-no-queue")
+    release_id = await _release(lifecycle_pool, app_id, "1.0.0")
+    vault_id = await _vault(lifecycle_pool, "install-no-queue")
+
+    async def no_job(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(rollout, "enqueue_installation_rollout", no_job)
+
+    with pytest.raises(ConflictError, match="could not be queued"):
+        await _command(lifecycle_pool, app_id, vault_id, release_id)
+
+    async with lifecycle_pool.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT count(*) FROM vault_app_installations WHERE app_id=$1 AND vault_id=$2",
+            app_id,
+            vault_id,
+        ) == 0
+        assert await conn.fetchval(
+            "SELECT count(*) FROM app_rollout_jobs WHERE app_id=$1",
+            app_id,
+        ) == 0
 
 
 async def test_non_admin_denial_is_generic_before_registry_lookup(lifecycle_pool):

@@ -22,6 +22,7 @@ from app.exceptions import (
     NotFoundError,
     ValidationError,
 )
+from app.services import app_rollout_service
 from app.services.access_service import check_vault_access
 from app.services.app_identity_service import (
     SUPPORTED_APP_CAPABILITIES,
@@ -572,6 +573,21 @@ async def command_installation(
                         command_status="accepted",
                         replayed=False,
                     )
+                if (
+                    result["command_status"] == "accepted"
+                    and normalized_mode in {"install", "fresh"}
+                ):
+                    queued = await app_rollout_service.enqueue_installation_rollout(
+                        conn,
+                        app_id,
+                        vault_id,
+                        result["installation_id"],
+                        release_id,
+                    )
+                    if queued is None:
+                        raise ConflictError(
+                            "Installation rollout could not be queued"
+                        )
     except asyncpg.UniqueViolationError:
         _record_command_error(
             action,

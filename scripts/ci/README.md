@@ -121,7 +121,7 @@ The topology is deliberately small:
 | embedding stub | Ubuntu host process | `127.0.0.1:8888` | deterministic `/v1/embeddings` responses |
 | backend | Ubuntu host process | `127.0.0.1:8000` | AKB application under test |
 | frontend (`--with-frontend`) | Ubuntu host process | `127.0.0.1:3000` by default | existing Vite SPA and per-run backend proxy |
-| fixture control | supervisor-owned in-process app | `127.0.0.1:8889` | health, discovery, and in-place scenario reset |
+| fixture control | supervisor-owned in-process app | `127.0.0.1:8889` | health, discovery, and isolated scenario reset |
 | MCP pytest behavior suite | Ubuntu host process | no public listener | authenticated MCP product scenarios through the official Python SDK |
 | curated suite runner | Ubuntu host process | no public listener | curated shell gate and count semantics |
 
@@ -148,14 +148,84 @@ The supervisor has two modes:
   the existing frontend package's `pnpm run dev` contract on `--frontend-port`
   (default `3000`), with its `/api` and `/mcp` proxy pointed at this run's
   backend origin. The fixture's
-  `POST /reset` performs an in-place scenario reset: it preserves the
-  PostgreSQL/MinIO containers, Compose network/volumes, and managed backend,
-  embedding, and stdio process identities while clearing application rows,
-  objects, and Git fixture data, then waits for backend readiness again; the
-  frontend process remains owned by the same serve lifecycle. Transient
-  MinIO list/delete/empty-verification failures receive a bounded idempotent
-  retry; reset discovery records the attempt count, retry count, elapsed time,
-  and redacted operation diagnostic.
+  `POST /reset` reuses PostgreSQL, MinIO, their volumes/network, and the
+  embedding process. It closes fixture-control admission and stops stdio, then
+  asks the backend to stop accepting requests and claiming new worker work.
+  The test-only `e2e_backend.py` launcher drains HTTP and worker tasks, joins
+  executor work, and emits a private PID/launch-bound shutdown report. Reset
+  requires that report, normal process exit, and no remaining owned process
+  groups. A signal, timeout, cancellation, or forced kill is not a drain proof.
+
+  With the backend stopped, a maintenance connection closes PostgreSQL's
+  database admission and waits for earlier client sessions to finish/close.
+  Row cleanup and removal of tables added by tests run in one transaction;
+  installation/migration singleton state remains valid. A missing canonical
+  table fails closed. Admission reopens only after successful cleanup. Fixtures
+  are seeded offline, then the backend is restarted once to rebuild its caches;
+  a fresh PAT and stdio initialization must succeed before readiness is published.
+
+  Git paths, configuration, and MinIO buckets use a new generation on the same
+  storage. Earlier paths/buckets remain retired until runtime cleanup, so even
+  an ambiguous delayed remote PUT cannot enter the next scenario. Retired
+  objects can consume storage during long runs. Supervisor cleanup removes its
+  Compose volumes; the caller removes the private runtime root after collecting
+  logs. Frontend and fixture origins remain stable, and the installed Node
+  consumer is reused. Reset never truncates tables under live backend workers.
+
+  Reset has one total `--timeout-seconds` budget (default 180 seconds). The MCP
+  pytest and catalog clients allow 210 seconds for the default reset response.
+  Failure or cancellation leaves the fixture `failed`, hides stale discovery,
+  and rejects further mutations/resets; dispose it and start a fresh runtime.
+  Queued controls from an earlier generation are rejected. Evidence records
+  `strategy: reuse_after_drain`, shutdown acknowledgement, generation, stable
+  dependency/replaced application identities, total/per-phase times, and failure
+  phase. These are test isolation guarantees, not a distributed transaction.
+
+A local #686 comparison used `transport-proxy`, `empty`, no frontend, three
+serial idle resets per implementation, and identical prebuilt PostgreSQL/pinned
+MinIO images. Preparation and final cleanup were excluded. On macOS arm64 with
+Docker Engine 29.1.2:
+
+| Reset strategy | Three samples (seconds) | Mean |
+| --- | --- | --- |
+| Full recreation (`a6d0f86f`) | 14.088 / 14.165 / 14.179 | 14.144s |
+| Dependency reuse after acknowledged drain | 5.370 / 6.978 / 6.211 | 6.186s |
+
+Reuse saved 7.957 seconds/reset (56.3%). Mean phases were backend drain 0.637s,
+offline PG reset 0.512s, fixture preparation 0.569s, backend restart 3.980s,
+stdio restart 0.076s; dependency identity verification adds about 0.412s.
+An earlier uncoordinated live reset measured 1.038s, but did not ensure writer
+completion. This small local sample measures idle reset latency, not load p95,
+full-suite throughput, or monetary cost. The measurement Compose used a prebuilt
+PG image rather than invoking a build. Retired namespace storage was not included
+in the time measurement; it remains until runtime disposal. Runtime phase evidence
+allows measurements on other hosts.
+
+The fixture password hash is computed once per runtime and reused while the
+injected password is unchanged. Reset still restores account permissions/status
+and scenario data; fresh tokens and storage generations are unchanged. The cache
+has one private in-memory entry, is replaced on password rotation, and is only
+populated after successful hashing. It is not emitted in discovery or logs.
+
+A subsequent five-reset comparison against `d9a5082f` used the same idle profile
+and images. Fixture preparation mean fell from 0.496s to 0.191s (61.4%); median
+fell from 0.456s to 0.158s. Total reset mean was 3.790s before and 3.372s after
+(11.0%). Backend startup mean was nearly unchanged at 2.240s/2.250s. Across initial
+preparation plus five resets, supervisor bcrypt calls fell from six to one.
+These before/after samples are the relevant comparison for the cache change;
+startup latency differs from the earlier three-sample run above.
+
+The E2E workflow also runs the Docker-backed reset regression explicitly:
+
+```bash
+AKB_TEST_RESET_ISOLATION=1 uv run --locked --project backend python -m pytest \
+  backend/tests/test_e2e_runtime_reset_isolation.py -v --tb=short
+```
+
+It holds a database writer across reset, proves reset waits and new SQL admission
+is closed, then verifies PG/MinIO/embed identities stay stable while PAT/stdio
+and Git/bucket generations rotate. A real API document verifies backend config
+loading; canonical-table corruption must leave reset/readiness/SQL admission closed.
 
 The native catalog benchmark launcher is separate from this generic runtime;
 its interface and descriptor composition are documented in
@@ -404,8 +474,8 @@ When changing this area, preserve all of the following:
 - the optional frontend process uses an explicit `--with-frontend` flag, an
   isolated `--frontend-port`, and the run's backend origin for Vite proxying;
 - descriptor stdout stays parseable as one schema v2 JSON line; and
-- fixture reset keeps PostgreSQL/MinIO dependency identities stable and
-  publishes the reset count, duration, and preservation evidence; and
+- fixture reset acknowledges backend drain before reusing PostgreSQL/MinIO,
+  fences SQL admission, publishes phase evidence, and fails closed; and
 - the catalog benchmark's four cell runtimes remain isolated, with parallel
   cells and serial mutable-state trials inside each cell; and
 - runtime state stays private and outside the checkout.

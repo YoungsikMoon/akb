@@ -307,7 +307,7 @@ are not valid `compare` inputs.
 Provider requests use the manifest's preregistered `request_timeout_seconds`
 and are always capped by the remaining monotonic `max_wall_seconds` deadline.
 The timeout is recorded in the manifest and artifact. The repository runtime's
-180-second reset/readiness budget is separate. Failures without model request,
+180-second readiness budget and 210-second reset HTTP budget are separate. Failures without model request,
 usage/cost, or state evidence remain incomplete and are written to a failed
 checkpoint; a zero-request arm cannot be a successful baseline. A failure
 with provider usage/cost and both state observations remains a measured
@@ -321,13 +321,19 @@ failures; timeouts produce incomplete artifacts and failed, resume-eligible
 checkpoint records; hidden retries and fallbacks are disabled, and only resume
 can retry them.
 
-The four cells use separate runtime and Compose namespaces. PostgreSQL/MinIO
-containers, Compose network/volumes, and backend/embedding/stdio process
-identities remain stable across in-place reset. Reset clears only application
-rows, MinIO objects, and Git fixture data, then reseeds and waits for
-readiness. Adjacent trials do not run duplicate teardown/setup resets; the
-next setup owns the single reset boundary. Reset count/time and identity
-preservation are recorded in evidence.
+The four cells use separate runtime and Compose namespaces. Each reset reuses
+PostgreSQL/MinIO containers, their network/volumes, and the embedding process.
+The backend stops accepting HTTP and claiming worker work, drains its tasks and
+executors, and must acknowledge normal shutdown before offline reset. Database
+admission is fenced while earlier SQL clients finish; application data is then
+cleared atomically. Fixtures are seeded offline and the backend/stdio restart
+with fresh credentials and Git/bucket generations. Retired namespaces prevent
+late old writes reaching the next trial and are disposed with runtime storage.
+Fixture/application origins remain stable. A failed drain/reset stays unready
+and requires runtime disposal. Adjacent trials avoid duplicate teardown/setup
+resets; the next setup owns the single reset boundary. Evidence records stable
+dependency and replaced application identities, generation, drain acknowledgement,
+and reset count/total/per-phase time.
 
 Timing records every resume attempt, including cumulative
 `end_to_end_wall_seconds` and provisioning, credential, catalog capture,
@@ -374,7 +380,7 @@ Each run artifact includes:
 - the shared executed/reused arm-order evidence and pair-global budget totals,
   sealed into both independent arm artifact hashes;
 - cumulative wall-clock, checkpoint new/reused/rerun counts, fixture reset
-  count/time, dependency identity preservation, four-cell smoke results, and
+  count/time, dependency reuse identities, four-cell smoke results, and
   reproducible `artifact_hash_input`/`artifact_hash`;
 - overall metrics, model/transport run metrics, category comparisons, and
   locale-stratified metrics for `ko-KR` and `en-US`. Locale and pair IDs are

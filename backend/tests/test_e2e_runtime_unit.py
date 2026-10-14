@@ -9,7 +9,6 @@ import stat
 import subprocess
 import sys
 import uuid
-from types import SimpleNamespace
 from pathlib import Path
 
 import httpx
@@ -28,7 +27,6 @@ from e2e_runtime import (  # noqa: E402
     E2ERuntime,
     ManagedProcess,
     ProvisioningFailure,
-    MinioResetFailure,
     SOURCE_REVISION_ENV,
     RuntimeConfig,
     _fixture_schema_fingerprint,
@@ -63,42 +61,6 @@ WORKFLOW = REPO_ROOT / ".github" / "workflows" / "e2e.yml"
 LOCAL_CANONICAL_RUNNER = REPO_ROOT / "scripts" / "run_canonical_e2e.sh"
 
 
-class _FakeMinioPaginator:
-    def __init__(self, client) -> None:
-        self.client = client
-
-    def paginate(self, *, Bucket: str):
-        return self.client.pages(Bucket)
-
-
-class _FakeMinioClient:
-    def __init__(self, pages, delete_results=None) -> None:
-        self._pages = pages
-        self._delete_results = list(delete_results or [])
-        self.delete_calls: list[list[str]] = []
-        self.paginate_calls = 0
-
-    def get_paginator(self, _name: str) -> _FakeMinioPaginator:
-        return _FakeMinioPaginator(self)
-
-    def pages(self, _bucket: str):
-        self.paginate_calls += 1
-        result = self._pages[self.paginate_calls - 1]
-        if isinstance(result, BaseException):
-            raise result
-        return result
-
-    def delete_objects(self, *, Bucket: str, Delete: dict[str, object]):
-        keys = [item["Key"] for item in Delete["Objects"]]
-        self.delete_calls.append(keys)
-        if self._delete_results:
-            result = self._delete_results.pop(0)
-            if isinstance(result, BaseException):
-                raise result
-            return result
-        return {}
-
-
 def test_stdio_sample_image_fixture_is_a_small_decodable_png() -> None:
     path = REPO_ROOT / "eval" / "mcp-catalog" / "fixtures" / "sample-image.png"
 
@@ -123,167 +85,6 @@ def test_authorization_fixture_vault_repository_is_initialized_idempotently(tmp_
     assert (bare / "objects").is_dir()
 
 
-def _install_fake_minio(monkeypatch: pytest.MonkeyPatch, client: object) -> None:
-    monkeypatch.setitem(sys.modules, "boto3", SimpleNamespace(client=lambda *_args, **_kwargs: client))
-
-
-def test_minio_reset_retries_endpoint_failure_and_reports_recovery(monkeypatch, tmp_path):
-    from botocore.exceptions import EndpointConnectionError
-
-    runtime = E2ERuntime(make_config(tmp_path))
-    client = _FakeMinioClient(
-        [
-            EndpointConnectionError(endpoint_url="http://minio.invalid"),
-            [{"Contents": []}],
-            [{"Contents": []}],
-        ]
-    )
-    sleeps: list[float] = []
-    _install_fake_minio(monkeypatch, client)
-    monkeypatch.setattr(e2e_runtime.time, "sleep", sleeps.append)
-
-    evidence = runtime._clear_minio_objects()
-
-    assert evidence["status"] == "recovered"
-    assert evidence["attempts"] == 2
-    assert evidence["retry_count"] == 1
-    assert evidence["wall_seconds"] >= 0
-    assert sleeps == [e2e_runtime.MINIO_RESET_BACKOFF_SECONDS[0]]
-    assert client.delete_calls == []
-
-
-def test_minio_reset_retries_partial_delete_and_verifies_empty(monkeypatch, tmp_path):
-    runtime = E2ERuntime(make_config(tmp_path))
-    client = _FakeMinioClient(
-        [
-            [{"Contents": [{"Key": "a"}, {"Key": "b"}]}],
-            [{"Contents": [{"Key": "b"}]}],
-            [{"Contents": []}],
-        ],
-        delete_results=[
-            {"Errors": [{"Key": "b", "Code": "SlowDown", "Message": "retry"}]},
-            {},
-        ],
-    )
-    sleeps: list[float] = []
-    _install_fake_minio(monkeypatch, client)
-    monkeypatch.setattr(e2e_runtime.time, "sleep", sleeps.append)
-
-    evidence = runtime._clear_minio_objects()
-
-    assert evidence["status"] == "recovered"
-    assert evidence["attempts"] == 2
-    assert client.delete_calls == [["a", "b"], ["b"]]
-    assert sleeps == [e2e_runtime.MINIO_RESET_BACKOFF_SECONDS[0]]
-
-
-def test_minio_reset_chunks_large_delete_requests_to_s3_limit(monkeypatch, tmp_path):
-    runtime = E2ERuntime(make_config(tmp_path))
-    keys = [{"Key": f"object-{index}"} for index in range(e2e_runtime.MINIO_DELETE_BATCH_SIZE + 1)]
-    client = _FakeMinioClient(
-        [[{"Contents": keys}], [{"Contents": []}]],
-        delete_results=[{}, {}],
-    )
-    _install_fake_minio(monkeypatch, client)
-
-    evidence = runtime._clear_minio_objects()
-
-    assert evidence["status"] == "success"
-    assert [len(batch) for batch in client.delete_calls] == [1000, 1]
-
-
-def test_minio_reset_rejects_non_retryable_delete_error_without_retry(monkeypatch, tmp_path):
-    runtime = E2ERuntime(make_config(tmp_path))
-    runtime._fixture_private_values = ("fixture-password",)
-    client = _FakeMinioClient(
-        [[{"Contents": [{"Key": "a"}]}]],
-        delete_results=[
-            {
-                "Errors": [
-                    {
-                        "Key": "a",
-                        "Code": "AccessDenied",
-                        "Message": "fixture-password is not allowed",
-                    }
-                ]
-            }
-        ],
-    )
-    sleeps: list[float] = []
-    _install_fake_minio(monkeypatch, client)
-    monkeypatch.setattr(e2e_runtime.time, "sleep", sleeps.append)
-
-    with pytest.raises(MinioResetFailure) as raised:
-        runtime._clear_minio_objects()
-
-    assert "operation=delete" in str(raised.value)
-    assert "s3_code=AccessDenied" in str(raised.value)
-    assert "attempt=1/" in str(raised.value)
-    assert "fixture-password" not in str(raised.value)
-    assert sleeps == []
-    assert raised.value.evidence["retry_count"] == 0
-
-
-def test_minio_reset_reports_exhausted_retryable_failure(monkeypatch, tmp_path):
-    from botocore.exceptions import EndpointConnectionError
-
-    runtime = E2ERuntime(make_config(tmp_path))
-    client = _FakeMinioClient(
-        [EndpointConnectionError(endpoint_url="http://minio.invalid")] * e2e_runtime.MINIO_RESET_MAX_ATTEMPTS
-    )
-    sleeps: list[float] = []
-    _install_fake_minio(monkeypatch, client)
-    monkeypatch.setattr(e2e_runtime.time, "sleep", sleeps.append)
-
-    with pytest.raises(MinioResetFailure) as raised:
-        runtime._clear_minio_objects()
-
-    assert "operation=list" in str(raised.value)
-    assert "attempt=3/3" in str(raised.value)
-    assert raised.value.evidence["status"] == "failed"
-    assert raised.value.evidence["attempts"] == e2e_runtime.MINIO_RESET_MAX_ATTEMPTS
-    assert raised.value.evidence["retry_count"] == e2e_runtime.MINIO_RESET_MAX_ATTEMPTS - 1
-    assert len(sleeps) == e2e_runtime.MINIO_RESET_MAX_ATTEMPTS - 1
-
-
-@pytest.mark.asyncio
-async def test_same_runtime_reset_attempts_are_serialized_and_evidence_is_recorded(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    runtime = E2ERuntime(make_config(tmp_path))
-    runtime._prepared = True
-    runtime.config.vault_dir.mkdir(parents=True)
-    state = {"active": 0, "max_active": 0, "calls": 0}
-
-    async def postgres_reset() -> None:
-        state["active"] += 1
-        state["max_active"] = max(state["max_active"], state["active"])
-        await asyncio.sleep(0)
-        state["active"] -= 1
-
-    def minio_reset() -> dict[str, object]:
-        state["calls"] += 1
-        return {"status": "recovered", "attempts": 2, "retry_count": 1, "wall_seconds": 0.01}
-
-    identity = {"services": {"minio": {"container_id": "m"}, "postgres": {"container_id": "p"}}}
-    monkeypatch.setattr(runtime, "_dependency_identity_snapshot", lambda: identity)
-    monkeypatch.setattr(runtime, "_process_identity_snapshot", lambda: {"backend": {"pid": 1, "running": True}})
-    monkeypatch.setattr(runtime, "_reset_postgres_in_place", postgres_reset)
-    monkeypatch.setattr(runtime, "_clear_minio_objects", minio_reset)
-    monkeypatch.setattr(runtime, "_seed_external_credential", lambda: asyncio.sleep(0))
-    monkeypatch.setattr(runtime, "_mint_runtime_pat", lambda: asyncio.sleep(0))
-    monkeypatch.setattr(runtime, "_ensure_minio_bucket", lambda: None)
-    monkeypatch.setattr(runtime, "_wait_tcp", lambda *_args, **_kwargs: asyncio.sleep(0))
-    monkeypatch.setattr(runtime, "_wait_http", lambda *_args, **_kwargs: asyncio.sleep(0))
-
-    await asyncio.gather(runtime.reset_scenario(), runtime.reset_scenario())
-
-    assert state["max_active"] == 1
-    assert state["calls"] == 2
-    assert runtime._dependency_reset_evidence["minio_reset"]["retry_count"] == 1
-
-
 def make_config(tmp_path: Path, *, mode: str = "serve") -> RuntimeConfig:
     return RuntimeConfig(
         checkout=REPO_ROOT,
@@ -293,41 +94,6 @@ def make_config(tmp_path: Path, *, mode: str = "serve") -> RuntimeConfig:
         compose_project="akb-e2e-unit",
         credentials=CredentialNames("TEST_USERNAME_ENV", "TEST_PASSWORD_ENV"),
     )
-
-
-@pytest.mark.asyncio
-async def test_postgres_reset_preserves_diagnostic_and_recovers_on_next_attempt(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    runtime = E2ERuntime(make_config(tmp_path))
-    monkeypatch.setenv("TEST_USERNAME_ENV", "fixture-user")
-    monkeypatch.setenv("TEST_PASSWORD_ENV", "fixture-password")
-    state = {"fail_once": True, "execute_calls": 0, "close_calls": 0}
-
-    class Connection:
-        async def execute(self, *_args: object) -> None:
-            state["execute_calls"] += 1
-            if state["fail_once"]:
-                state["fail_once"] = False
-                raise RuntimeError("deadlock detected while truncating fixture")
-
-        async def close(self) -> None:
-            state["close_calls"] += 1
-
-    connection = Connection()
-
-    async def connect(**_kwargs: object) -> Connection:
-        return connection
-
-    monkeypatch.setitem(sys.modules, "asyncpg", SimpleNamespace(connect=connect))
-
-    with pytest.raises(ProvisioningFailure, match="deadlock detected while truncating fixture"):
-        await runtime._reset_postgres_in_place()
-    await runtime._reset_postgres_in_place()
-
-    assert state["execute_calls"] == 4
-    assert state["close_calls"] == 2
 
 
 @pytest.mark.asyncio
@@ -423,6 +189,8 @@ def test_frontend_descriptor_exposes_web_origin_and_backend_proxy_target(tmp_pat
             frontend_port=3017,
         )
     )
+    runtime._prepared = True
+    runtime._lifecycle_state = "ready"
 
     descriptor = runtime.descriptor()
     assert descriptor["services"]["web"] == {
@@ -495,6 +263,7 @@ def test_runtime_assets_live_in_repository_common_layer():
 
     for name in (
         "e2e_runtime.py",
+        "e2e_backend.py",
         "e2e_suite_runner.py",
         "fixture_control.py",
         "oidc_fixture.py",
@@ -593,6 +362,8 @@ def test_fixture_discovery_declares_auth_and_observability_without_secrets(
     monkeypatch.setenv("TEST_USERNAME_ENV", "external-user-value")
     monkeypatch.setenv("TEST_PASSWORD_ENV", "external-password-value")
     runtime = E2ERuntime(make_config(tmp_path))
+    runtime._prepared = True
+    runtime._lifecycle_state = "ready"
     runtime._fixture_catalog = {
         "status": "ready",
         "scenario": "app-installation-lifecycle",
@@ -635,6 +406,8 @@ def test_member_installation_discovery_declares_http_contract_and_fixture_contro
             make_config(tmp_path), scenario="app-installation-lifecycle"
         )
     )
+    runtime._prepared = True
+    runtime._lifecycle_state = "ready"
     app_id = str(uuid.uuid4())
     vault_id = str(uuid.uuid4())
     runtime._fixture_catalog = {
@@ -744,6 +517,8 @@ async def test_member_installation_fixture_controls_touch_only_the_selected_fixt
             make_config(tmp_path), scenario="app-installation-lifecycle"
         )
     )
+    runtime._prepared = True
+    runtime._lifecycle_state = "ready"
     actor_id = uuid.uuid4()
     admin_id = uuid.uuid4()
     vault_id = uuid.uuid4()
@@ -868,6 +643,8 @@ async def test_member_installation_unavailable_fault_is_bounded_and_reversible(
             make_config(tmp_path), scenario="app-installation-lifecycle"
         )
     )
+    runtime._prepared = True
+    runtime._lifecycle_state = "ready"
     app_id = uuid.uuid4()
     vault_id = uuid.uuid4()
     installation_id = uuid.uuid4()
@@ -1008,6 +785,8 @@ async def test_member_installation_unavailable_fault_is_bounded_and_reversible(
         app_id, vault_id, user=user, correlation_id="after-fault"
     )
     other_scenario = E2ERuntime(make_config(tmp_path / "other"))
+    other_scenario._prepared = True
+    other_scenario._lifecycle_state = "ready"
     rejected_scenario = await other_scenario.fixture_control(
         "fault_injection", "status_active", True, "member_installation_unavailable"
     )
@@ -1032,61 +811,14 @@ async def test_member_installation_unavailable_fault_is_bounded_and_reversible(
     assert sum(query.startswith("ALTER TABLE") for query, _args in sql_calls) == 2
 
 
-@pytest.mark.asyncio
-async def test_reset_restores_member_installation_unavailable_fault_before_clearing(
-    tmp_path, monkeypatch
-):
-    runtime = E2ERuntime(
-        dataclasses.replace(
-            make_config(tmp_path), scenario="app-installation-lifecycle"
-        )
-    )
-    runtime._prepared = True
-    runtime._fixture_controls["fault"] = {
-        "target": "status_active",
-        "kind": "member_installation_unavailable",
-    }
-    operations: list[str] = []
-    identity = {"fixture": "stable"}
-    monkeypatch.setattr(runtime, "_dependency_identity_snapshot", lambda: identity)
-    monkeypatch.setattr(runtime, "_process_identity_snapshot", lambda: identity)
-
-    async def restore_fault(fixture, kind):
-        assert fixture == {}
-        assert kind == "member_installation_unavailable"
-        assert runtime._fixture_controls["fault"]["kind"] == kind
-        operations.append("restore")
-        return True
-
-    async def reset_postgres():
-        assert runtime._fixture_controls == {}
-        operations.append("reset_postgres")
-
-    monkeypatch.setattr(runtime, "_restore_fault", restore_fault)
-    monkeypatch.setattr(runtime, "_reset_postgres_in_place", reset_postgres)
-    monkeypatch.setattr(runtime, "_clear_minio_objects", lambda: {"status": "cleared"})
-    monkeypatch.setattr(runtime, "_ensure_minio_bucket", lambda: None)
-
-    async def no_op(*_args):
-        return None
-
-    monkeypatch.setattr(runtime, "_wait_tcp", no_op)
-    monkeypatch.setattr(runtime, "_wait_http", no_op)
-    monkeypatch.setattr(runtime, "_seed_external_credential", no_op)
-    monkeypatch.setattr(runtime, "_mint_runtime_pat", no_op)
-
-    await runtime.reset_scenario()
-
-    assert operations == ["restore", "reset_postgres"]
-    assert runtime._fixture_controls == {}
-
-
 def test_installation_discovery_publishes_success_lifecycle_command_bodies(tmp_path):
     runtime = E2ERuntime(
         dataclasses.replace(
             make_config(tmp_path), scenario="app-installation-lifecycle"
         )
     )
+    runtime._prepared = True
+    runtime._lifecycle_state = "ready"
     runtime._fixture_catalog = {
         "status": "ready",
         "scenario": "app-installation-lifecycle",
@@ -1150,6 +882,8 @@ def test_app_control_plane_descriptor_keeps_schema_v2_discovery_contract(tmp_pat
     runtime = E2ERuntime(
         dataclasses.replace(make_config(tmp_path), scenario="app-control-plane")
     )
+    runtime._prepared = True
+    runtime._lifecycle_state = "ready"
     runtime._fixture_catalog = {
         "status": "ready",
         "scenario": "app-control-plane",
@@ -1192,6 +926,8 @@ def test_raw_checkout_uses_explicit_source_revision_in_descriptor_and_discovery(
             scenario="app-control-plane",
         )
     )
+    runtime._prepared = True
+    runtime._lifecycle_state = "ready"
 
     descriptor = runtime.descriptor()
     discovery = runtime.fixture_discovery()
@@ -1256,6 +992,8 @@ def test_app_control_plane_discovery_exposes_legacy_adoption_target_and_drift_co
     runtime = E2ERuntime(
         dataclasses.replace(make_config(tmp_path), scenario="app-control-plane")
     )
+    runtime._prepared = True
+    runtime._lifecycle_state = "ready"
     runtime._fixture_catalog = {
         "status": "ready",
         "scenario": "app-control-plane",
@@ -1774,6 +1512,8 @@ async def test_control_plane_reset_discovery_serializes_success_installation_com
         )
     )
     runtime._prepared = True
+    runtime._lifecycle_state = "ready"
+    runtime._prepared = True
     app_id = "11111111-1111-4111-8111-111111111111"
     restore_vault_id = "22222222-2222-4222-8222-222222222222"
     fresh_vault_id = "33333333-3333-4333-8333-333333333333"
@@ -1829,7 +1569,11 @@ async def test_control_plane_reset_discovery_serializes_success_installation_com
 
 
 class _LifecycleProcess:
+    _next_pid = 900_000
+
     def __init__(self) -> None:
+        self.pid = type(self)._next_pid
+        type(self)._next_pid += 1
         self.release = asyncio.Event()
         self.returncode: int | None = None
 
@@ -1862,38 +1606,6 @@ async def test_serve_ignores_process_exit_after_reset_replaces_the_process(tmp_p
     assert runtime._children["backend"].process is new_process
 
 
-@pytest.mark.asyncio
-async def test_restart_requested_during_reset_is_deferred_until_reset_finishes(tmp_path):
-    runtime = E2ERuntime(make_config(tmp_path))
-    runtime._lifecycle_generation = 4
-    calls: list[str] = []
-
-    async def record_stop(_name: str) -> None:
-        calls.append("stop")
-        runtime._children.pop("backend", None)
-
-    async def record_start() -> None:
-        calls.append("start")
-        runtime._children["backend"] = ManagedProcess(_LifecycleProcess())
-
-    runtime._stop_named_process = record_stop  # type: ignore[method-assign]
-    runtime._start_backend = record_start  # type: ignore[method-assign]
-
-    async with runtime._reset_lock:
-        runtime._resetting = True
-        result = await runtime.fixture_control("restart", None, True)
-        await asyncio.sleep(0)
-        assert calls == []
-        runtime._resetting = False
-
-    for _ in range(3):
-        await asyncio.sleep(0)
-
-    assert result["status"] == "accepted"
-    assert calls == ["stop", "start"]
-    assert runtime.app_ready is True
-
-
 def test_rollout_fixture_discovery_is_generic_and_redacted(tmp_path):
     runtime = E2ERuntime(
         RuntimeConfig(
@@ -1905,6 +1617,8 @@ def test_rollout_fixture_discovery_is_generic_and_redacted(tmp_path):
             scenario="app-release-rollout",
         )
     )
+    runtime._prepared = True
+    runtime._lifecycle_state = "ready"
     descriptor = runtime.descriptor()
     assert descriptor["schema_version"] == 2
     assert descriptor["status"] == "ready"
@@ -1945,6 +1659,8 @@ def test_rollout_discovery_advertises_same_coordinates_for_each_app(tmp_path):
             scenario="app-release-rollout",
         )
     )
+    runtime._prepared = True
+    runtime._lifecycle_state = "ready"
     runtime._fixture_catalog = {
         "status": "ready",
         "scenario": "app-release-rollout",
@@ -1992,6 +1708,8 @@ def test_rollout_fault_control_discovery_uses_fixture_ids_and_kinds(tmp_path):
             scenario="app-release-rollout",
         )
     )
+    runtime._prepared = True
+    runtime._lifecycle_state = "ready"
     runtime._fixture_catalog = {
         "status": "ready",
         "scenario": "app-release-rollout",
@@ -2032,6 +1750,8 @@ async def test_rollout_fault_control_applies_before_ack(tmp_path, monkeypatch):
             scenario="app-release-rollout",
         )
     )
+    runtime._prepared = True
+    runtime._lifecycle_state = "ready"
     runtime._fixture_catalog = {
         "status": "ready",
         "scenario": "app-release-rollout",
@@ -2075,6 +1795,8 @@ async def test_rollout_fault_disable_restores_fixture_before_ack(tmp_path, monke
             scenario="app-release-rollout",
         )
     )
+    runtime._prepared = True
+    runtime._lifecycle_state = "ready"
     runtime._fixture_catalog = {
         "status": "ready",
         "scenario": "app-release-rollout",
@@ -2192,6 +1914,8 @@ def test_capability_profiles_are_explicit_and_composable():
 
 def test_tool_only_does_not_advertise_optional_processes(tmp_path):
     runtime = E2ERuntime(make_config(tmp_path))
+    runtime._prepared = True
+    runtime._lifecycle_state = "ready"
     descriptor = runtime.descriptor()
     assert set(descriptor["services"]) == {"app", "fixture"}
     assert "profile" not in descriptor
@@ -2266,3 +1990,953 @@ def test_optional_capabilities_fail_closed_without_silent_skip(tmp_path, monkeyp
     )
     with pytest.raises(BlockedRuntimeConfig, match="stdio capability"):
         transport._validate_profile()
+
+
+def _ready_runtime(tmp_path):
+    runtime = E2ERuntime(make_config(tmp_path))
+    runtime._prepared = True
+    runtime._lifecycle_state = "ready"
+    runtime._children["backend"] = ManagedProcess(_LifecycleProcess())
+    runtime._fixture_catalog = {"status": "ready", "private_old_fixture": "old-generation"}
+    return runtime
+
+
+def _stub_reuse_reset(monkeypatch, runtime, *, fail_at=None, block_at=None):
+    """Replace external I/O while exercising admission, ordering and failure state."""
+    calls = []
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    identity = {"services": {"postgres": "same-postgres", "minio": "same-minio"}}
+    runtime._dependency_identity = identity
+    embed = ManagedProcess(_LifecycleProcess())
+    runtime._children["embed"] = embed
+
+    async def operation(name):
+        calls.append(name)
+        assert not runtime._prepared
+        assert runtime.fixture_health()["status"] != "ready"
+        assert runtime.fixture_discovery()["status"] != "ready"
+        if name == block_at:
+            entered.set()
+            await release.wait()
+        if name == fail_at:
+            raise ProvisioningFailure(f"injected failure: {name}")
+
+    async def stop(name):
+        assert name == "stdio", "reset must preserve the embedding process"
+        await operation(f"stop:{name}")
+        runtime._children.pop(name, None)
+
+    async def drain():
+        await operation("drain")
+        runtime._children.pop("backend", None)
+
+    async def reset_postgres():
+        assert "backend" not in runtime._children
+        await operation("postgres")
+
+    async def seed():
+        assert "backend" not in runtime._children
+        await operation("seed")
+        runtime._fixture_catalog = {"status": "ready", "fixture_generation": runtime.config.storage_generation}
+
+    async def start_backend():
+        await operation("backend")
+        runtime._children["backend"] = ManagedProcess(_LifecycleProcess())
+
+    async def mint_pat():
+        await operation("pat")
+        runtime._pat_value = f"new-token-{runtime.config.storage_generation}"
+
+    def ensure_bucket():
+        calls.append("bucket")
+        if fail_at == "bucket":
+            raise ProvisioningFailure("injected failure: bucket")
+
+    async def forbidden(*args, **kwargs):
+        pytest.fail("reset must reuse running dependencies instead of rebuilding them")
+
+    monkeypatch.setattr(runtime, "_stop_named_process", stop)
+    monkeypatch.setattr(runtime, "_drain_backend", drain)
+    monkeypatch.setattr(runtime, "_reset_postgres_offline", reset_postgres)
+    monkeypatch.setattr(runtime, "_write_config", lambda: calls.append("config"))
+    monkeypatch.setattr(runtime, "_ensure_minio_bucket", ensure_bucket)
+    monkeypatch.setattr(runtime, "_seed_external_credential", seed)
+    monkeypatch.setattr(runtime, "_start_backend", start_backend)
+    monkeypatch.setattr(runtime, "_mint_runtime_pat", mint_pat)
+    monkeypatch.setattr(runtime, "_start_stdio_proxy", lambda: operation("stdio"))
+    monkeypatch.setattr(runtime, "_compose", forbidden)
+    monkeypatch.setattr(runtime, "_start_dependencies", forbidden)
+    monkeypatch.setattr(runtime, "_start_embed_stub", forbidden)
+    monkeypatch.setattr(runtime, "_bootstrap_backend_and_seed", forbidden)
+    monkeypatch.setattr(runtime, "_dependency_identity_snapshot", lambda: identity)
+    monkeypatch.setattr(runtime, "_process_identity_snapshot", lambda: {})
+    return calls, entered, release, embed
+
+
+@pytest.mark.asyncio
+async def test_reset_reuses_dependencies_only_after_drain_and_publishes_new_generation(tmp_path, monkeypatch):
+    runtime = _ready_runtime(tmp_path)
+    old_git_path = runtime.config.vault_dir
+    old_bucket = runtime.config.s3_bucket
+    old_git_path.mkdir(parents=True)
+    runtime._fixture_controls["fault"] = {"kind": "member_installation_unavailable"}
+    runtime._pat_value = "old-token"
+    calls, _, _, embed = _stub_reuse_reset(monkeypatch, runtime)
+
+    await runtime.reset_scenario()
+
+    assert calls[:3] == ["stop:stdio", "drain", "postgres"]
+    assert calls.index("postgres") < calls.index("config") < calls.index("bucket") < calls.index("seed")
+    assert calls.index("seed") < calls.index("backend") < calls.index("pat")
+    assert runtime._children["embed"] is embed
+    assert runtime.config.storage_generation == 1
+    assert runtime.config.vault_dir != old_git_path
+    assert runtime.config.s3_bucket != old_bucket
+    # A delayed write keeps addressing the retired generation's storage.
+    old_git_path.mkdir(parents=True, exist_ok=True)
+    (old_git_path / "late-old-write").write_text("old data")
+    assert not (runtime.config.vault_dir / "late-old-write").exists()
+    assert runtime._fixture_controls == {}
+    assert runtime._pat_value == "new-token-1"
+    assert runtime._prepared
+    assert runtime.fixture_health()["status"] == "ready"
+    assert runtime.fixture_discovery()["fixture_generation"] == 1
+    evidence = runtime._dependency_reset_evidence
+    assert evidence["strategy"] == "reuse_after_drain"
+    assert evidence["identity_before"] == evidence["identity_after"]
+    assert evidence["last_succeeded"] is True
+    assert set(evidence["phase_seconds"]) == {
+        "drain_backend", "reset_postgres", "prepare_fixture", "start_backend", "start_stdio",
+    }
+
+
+@pytest.mark.asyncio
+async def test_concurrent_resets_are_serialized(tmp_path, monkeypatch):
+    runtime = _ready_runtime(tmp_path)
+    calls, entered, release, _ = _stub_reuse_reset(monkeypatch, runtime, block_at="seed")
+    first = asyncio.create_task(runtime.reset_scenario())
+    await entered.wait()
+    second = asyncio.create_task(runtime.reset_scenario())
+    await asyncio.sleep(0)
+    assert calls.count("postgres") == 1
+    release.set()
+    await asyncio.gather(first, second)
+    assert calls.count("postgres") == 2
+    assert runtime.config.storage_generation == 2
+    assert runtime._dependency_reset_evidence["count"] == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_at", ["drain", "postgres", "bucket", "seed", "backend", "pat", "stdio"])
+async def test_reset_failure_never_republishes_ready_or_allows_another_reset(tmp_path, monkeypatch, fail_at):
+    runtime = _ready_runtime(tmp_path)
+    runtime.profile = dataclasses.replace(runtime.profile, capabilities=runtime.profile.capabilities | {"stdio"})
+    calls, _, _, _ = _stub_reuse_reset(monkeypatch, runtime, fail_at=fail_at)
+    with pytest.raises(ProvisioningFailure, match="injected failure"):
+        await runtime.reset_scenario()
+    assert runtime._lifecycle_state == "failed"
+    assert not runtime._prepared
+    assert runtime.fixture_health()["status"] == "failed"
+    assert runtime.fixture_discovery()["status"] != "ready"
+    assert runtime._dependency_reset_evidence["last_succeeded"] is False
+    if fail_at == "drain":
+        assert "postgres" not in calls, "uncertified shutdown must prevent data deletion"
+        assert "config" not in calls
+    with pytest.raises(ProvisioningFailure):
+        await runtime.reset_scenario()
+    result = await runtime.fixture_control("restart", None, True)
+    assert result["status"] == "rejected"
+
+
+@pytest.mark.asyncio
+async def test_dependency_replacement_during_reset_cannot_publish_ready(tmp_path, monkeypatch):
+    runtime = _ready_runtime(tmp_path)
+    _stub_reuse_reset(monkeypatch, runtime)
+    seed = runtime._seed_external_credential
+
+    async def seed_after_dependency_changed():
+        await seed()
+        monkeypatch.setattr(runtime, "_dependency_identity_snapshot", lambda: {
+            "services": {"postgres": "unexpected-postgres", "minio": "same-minio"},
+        })
+
+    monkeypatch.setattr(runtime, "_seed_external_credential", seed_after_dependency_changed)
+    with pytest.raises(ProvisioningFailure):
+        await runtime.reset_scenario()
+    assert runtime._lifecycle_state == "failed"
+    assert not runtime._prepared
+    assert runtime.fixture_health()["status"] == "failed"
+    assert runtime.fixture_discovery()["status"] != "ready"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_reset_stays_failed(tmp_path, monkeypatch):
+    runtime = _ready_runtime(tmp_path)
+    _, entered, _, _ = _stub_reuse_reset(monkeypatch, runtime, block_at="seed")
+    task = asyncio.create_task(runtime.reset_scenario())
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert runtime._lifecycle_state == "failed"
+    assert not runtime._prepared
+    assert runtime.fixture_health()["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_control_queued_before_generation_change_cannot_mutate_new_fixture(tmp_path):
+    runtime = _ready_runtime(tmp_path)
+    async with runtime._reset_lock:
+        control = asyncio.create_task(runtime.fixture_control("restart", None, False))
+        await asyncio.sleep(0)
+        assert not control.done()
+        runtime._lifecycle_generation += 1
+    result = await control
+    assert result["status"] == "rejected"
+    assert runtime._fixture_controls == {}
+
+
+@pytest.mark.asyncio
+async def test_failed_process_stop_retains_process_for_cleanup(tmp_path, monkeypatch):
+    runtime = _ready_runtime(tmp_path)
+    original = runtime._children["backend"]
+
+    async def fail(*args, **kwargs):
+        raise ProvisioningFailure("termination failed")
+
+    monkeypatch.setattr(e2e_runtime, "terminate_process", fail)
+    with pytest.raises(ProvisioningFailure, match="termination failed"):
+        await runtime._stop_named_process("backend")
+    assert runtime._children["backend"] is original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("certificate", [
+    "valid", "missing", "malformed", "stale_launch", "wrong_pid",
+    "incomplete", "truthy_acknowledgement", "unclean_exit", "already_exited",
+])
+async def test_backend_drain_requires_matching_clean_shutdown_certificate(tmp_path, monkeypatch, certificate):
+    runtime = _ready_runtime(tmp_path)
+
+    class GracefulProcess:
+        pid = 654321
+        returncode = 0 if certificate == "already_exited" else None
+
+        def send_signal(self, signum):
+            assert signum == e2e_runtime.signal.SIGTERM
+            self.returncode = 1 if certificate == "unclean_exit" else 0
+
+        async def wait(self):
+            return self.returncode
+
+    managed = ManagedProcess(GracefulProcess())
+    runtime._children["backend"] = managed
+    runtime._backend_launch_id = "current-launch"
+    runtime._backend_drain_report = tmp_path / "drain.json"
+    report = {
+        "launch_id": "current-launch", "pid": GracefulProcess.pid,
+        "shutdown_complete": True,
+        "launcher_failed": False, "lifespan_failed": False, "forced_exit": False,
+        "pending_tasks": 0, "http_tasks": 0, "connections": 0,
+        "worker_loop_tasks": 0, "worker_inflight": 0, "worker_abandoned": 0,
+        "runner_snapshot_failed": False,
+    }
+    if certificate == "stale_launch":
+        report["launch_id"] = "previous-launch"
+    elif certificate == "wrong_pid":
+        report["pid"] += 1
+    elif certificate == "incomplete":
+        report["shutdown_complete"] = False
+    elif certificate == "truthy_acknowledgement":
+        report["shutdown_complete"] = "yes"
+    if certificate == "malformed":
+        runtime._backend_drain_report.write_text("not-json")
+    elif certificate != "missing":
+        runtime._backend_drain_report.write_text(json.dumps(report))
+    monkeypatch.setattr(e2e_runtime, "_live_process_groups", lambda *args: set())
+
+    if certificate == "valid":
+        await runtime._drain_backend()
+        assert "backend" not in runtime._children
+    else:
+        with pytest.raises(ProvisioningFailure):
+            await runtime._drain_backend()
+        assert runtime._children["backend"] is managed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["success", "missing_schema_table", "cleanup_error", "cleanup_close_error"])
+async def test_offline_postgres_reset_fences_from_maintenance_database_and_rolls_back_failures(
+    tmp_path, monkeypatch, outcome,
+):
+    import asyncpg
+
+    runtime = E2ERuntime(make_config(tmp_path))
+    monkeypatch.setenv("TEST_USERNAME_ENV", "fixture-user")
+    monkeypatch.setenv("TEST_PASSWORD_ENV", "fixture-password")
+    runtime._schema_tables = {
+        ("public", name) for name in (
+            "schema_migrations", "users", "tokens", "chunks", "bm25_stats", "bm25_vocab_epoch",
+        )
+    }
+    current = runtime._schema_tables | {("public", "scenario_table")}
+    if outcome == "missing_schema_table":
+        current.remove(("public", "chunks"))
+    events = []
+    allowed = True
+    pending_writes = []
+    committed_writes = []
+    in_transaction = False
+    waiting_clients = iter((True, False))
+
+    class Transaction:
+        async def __aenter__(self):
+            nonlocal in_transaction
+            assert not allowed
+            in_transaction = True
+            events.append(("transaction", "begin"))
+
+        async def __aexit__(self, exc_type, _exc, _traceback):
+            nonlocal in_transaction
+            in_transaction = False
+            if exc_type is None:
+                events.append(("transaction", "commit"))
+                committed_writes.extend(pending_writes)
+            else:
+                events.append(("transaction", "rollback"))
+            pending_writes.clear()
+            return False
+
+    class CleanupConnection:
+        closed = False
+
+        def transaction(self):
+            return Transaction()
+
+        async def fetchval(self, query):
+            assert not allowed
+            assert "pg_stat_activity" in query and "client backend" in query
+            events.append(("cleanup", "wait_clients"))
+            return next(waiting_clients)
+
+        async def fetch(self, query):
+            assert in_transaction
+            assert "pg_tables" in query
+            return [{"schemaname": schema, "tablename": table} for schema, table in current]
+
+        async def execute(self, query, *_args):
+            normalized = " ".join(query.split())
+            assert not normalized.startswith("ALTER DATABASE"), "admission DDL must use maintenance DB"
+            assert in_transaction, "all destructive cleanup must be atomic"
+            events.append(("cleanup", normalized))
+            if outcome == "cleanup_error" and normalized.startswith("DELETE FROM users"):
+                raise asyncpg.UndefinedTableError("sensitive-query-marker")
+            pending_writes.append(normalized)
+
+        async def close(self, *, timeout):
+            assert timeout == 5
+            self.closed = True
+            events.append(("cleanup", "close"))
+            if outcome == "cleanup_close_error":
+                raise OSError("cleanup close failed")
+
+    class MaintenanceConnection:
+        closed = False
+
+        async def execute(self, query):
+            nonlocal allowed
+            assert query in {
+                "ALTER DATABASE akb ALLOW_CONNECTIONS false",
+                "ALTER DATABASE akb ALLOW_CONNECTIONS true",
+            }
+            allowed = query.endswith("true")
+            events.append(("maintenance", query))
+
+        async def close(self, *, timeout):
+            assert timeout == 5
+            self.closed = True
+            events.append(("maintenance", "close"))
+
+    cleanup, maintenance = CleanupConnection(), MaintenanceConnection()
+
+    async def connect(**kwargs):
+        if kwargs["database"] == "akb":
+            return cleanup
+        assert kwargs["database"] == "postgres"
+        return maintenance
+
+    monkeypatch.setattr(asyncpg, "connect", connect)
+    if outcome in {"success", "cleanup_close_error"}:
+        if outcome == "cleanup_close_error":
+            with pytest.raises(OSError, match="cleanup close failed"):
+                await runtime._reset_postgres_offline()
+        else:
+            await runtime._reset_postgres_offline()
+        assert allowed
+        assert committed_writes
+        assert events.index(("transaction", "commit")) < events.index(
+            ("maintenance", "ALTER DATABASE akb ALLOW_CONNECTIONS true")
+        )
+        truncate = next(query for query in committed_writes if query.startswith("TRUNCATE TABLE"))
+        assert '"public"."tokens"' in truncate
+        assert '"public"."users"' not in truncate
+        assert '"public"."schema_migrations"' not in truncate
+    else:
+        with pytest.raises(ProvisioningFailure) as raised:
+            await runtime._reset_postgres_offline()
+        assert "sensitive-query-marker" not in str(raised.value)
+        assert not allowed, "a failed reset must retain its admission fence"
+        assert not committed_writes
+        assert ("transaction", "rollback") in events
+        assert ("maintenance", "ALTER DATABASE akb ALLOW_CONNECTIONS true") not in events
+        attempted = [query for connection, query in events if connection == "cleanup"]
+        if outcome == "missing_schema_table":
+            assert not any(query.startswith(("DROP TABLE", "TRUNCATE TABLE", "DELETE")) for query in attempted)
+        else:
+            assert any(query.startswith("DROP TABLE") for query in attempted)
+            assert any(query.startswith("TRUNCATE TABLE") for query in attempted)
+    assert cleanup.closed and maintenance.closed
+    assert events.index(("maintenance", "ALTER DATABASE akb ALLOW_CONNECTIONS false")) < events.index(
+        ("transaction", "begin")
+    )
+
+
+def _fixture_seed_database(monkeypatch):
+    """Retain the fixture user across seeds while exposing actual INSERT/UPDATE calls."""
+    import asyncpg
+
+    user = {"id": None}
+    queries = []
+    connections = []
+
+    class Connection:
+        closed = False
+
+        async def fetchval(self, query, username):
+            assert "SELECT id FROM users WHERE username = $1" in query
+            if user["id"] is not None:
+                assert user["username"] == username
+            return user["id"]
+
+        async def execute(self, query, *args):
+            normalized = " ".join(query.split())
+            queries.append((normalized, args))
+            if normalized.startswith("INSERT INTO users"):
+                actor_id, username, _email, password_hash = args
+                assert user["id"] is None
+                user.update(
+                    id=actor_id, username=username, password_hash=password_hash,
+                    is_admin=True, account_status="active", credential_change_required=False,
+                )
+            else:
+                assert normalized.startswith("UPDATE users")
+                assert all(field in normalized for field in (
+                    "password_hash = $2", "is_admin = TRUE", "account_status = 'active'",
+                    "credential_change_required = FALSE", "updated_at = NOW()",
+                ))
+                actor_id, password_hash = args
+                assert actor_id == user["id"]
+                user.update(
+                    password_hash=password_hash, is_admin=True,
+                    account_status="active", credential_change_required=False,
+                )
+
+        async def close(self):
+            self.closed = True
+
+    async def connect(**kwargs):
+        assert kwargs["database"] == "akb"
+        connection = Connection()
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(asyncpg, "connect", connect)
+    return user, queries, connections
+
+
+def _fixture_hash_spy(monkeypatch):
+    import bcrypt
+
+    calls = []
+
+    def hashpw(value, salt):
+        assert salt == b"test-salt"
+        calls.append(value)
+        return f"test-hash-{len(calls)}".encode("ascii")
+
+    monkeypatch.setattr(bcrypt, "gensalt", lambda: b"test-salt")
+    monkeypatch.setattr(bcrypt, "hashpw", hashpw)
+    return calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scenario,expected_helpers", [
+    ("empty", []),
+    ("app-installation-lifecycle", ["_seed_app_installation_lifecycle"]),
+    ("app-release-rollout", ["_seed_app_release_rollout"]),
+    ("app-control-plane", [
+        "_seed_app_release_rollout", "_seed_control_plane_installation_lifecycle",
+        "_seed_control_plane_legacy_adoption",
+    ]),
+])
+async def test_fixture_reuses_hash_but_restores_user_and_scenario_actors_on_every_seed(
+    tmp_path, monkeypatch, scenario, expected_helpers,
+):
+    runtime = E2ERuntime(dataclasses.replace(make_config(tmp_path), scenario=scenario))
+    monkeypatch.setenv("TEST_USERNAME_ENV", "fixture-user")
+    monkeypatch.setenv("TEST_PASSWORD_ENV", "first test value")
+    user, queries, connections = _fixture_seed_database(monkeypatch)
+    hashes = _fixture_hash_spy(monkeypatch)
+    helper_calls = []
+
+    def seed_helper(name):
+        async def seed(connection, *, password_hash, system_admin_id):
+            assert connection in connections
+            helper_calls.append((name, password_hash, system_admin_id))
+        return seed
+
+    for name in expected_helpers:
+        monkeypatch.setattr(runtime, name, seed_helper(name))
+    await runtime._seed_external_credential()
+    actor_id = user["id"]
+    initial_hash = user["password_hash"]
+    user.update(
+        password_hash="mutated test value", is_admin=False,  # pragma: allowlist secret
+        account_status="suspended", credential_change_required=True,
+    )
+    await runtime._seed_external_credential()
+
+    assert hashes == [b"first test value"]
+    assert user == {
+        "id": actor_id, "username": "fixture-user", "password_hash": initial_hash,
+        "is_admin": True, "account_status": "active", "credential_change_required": False,
+    }
+    assert len(queries) == 2
+    assert queries[0][0].startswith("INSERT INTO users")
+    assert queries[1][0].startswith("UPDATE users")
+    assert helper_calls == [
+        (name, initial_hash, actor_id) for name in expected_helpers + expected_helpers
+    ]
+    assert all(connection.closed for connection in connections)
+    assert runtime._fixture_password_cache[1] == initial_hash
+    assert isinstance(runtime._fixture_password_cache[0], bytes)
+    assert len(runtime._fixture_password_cache[0]) == 32
+    assert runtime._fixture_password_cache[0] != b"first test value"
+
+
+@pytest.mark.asyncio
+async def test_fixture_hash_cache_is_one_entry_and_owned_by_each_runtime(tmp_path, monkeypatch):
+    runtime = E2ERuntime(make_config(tmp_path))
+    monkeypatch.setenv("TEST_USERNAME_ENV", "fixture-user")
+    monkeypatch.setenv("TEST_PASSWORD_ENV", "first test value")
+    _fixture_seed_database(monkeypatch)
+    hashes = _fixture_hash_spy(monkeypatch)
+    await runtime._seed_external_credential()
+    first_fingerprint = runtime._fixture_password_cache[0]
+    monkeypatch.setenv("TEST_PASSWORD_ENV", "second test value")
+    await runtime._seed_external_credential()
+    assert runtime._fixture_password_cache[0] != first_fingerprint
+    monkeypatch.setenv("TEST_PASSWORD_ENV", "first test value")
+    await runtime._seed_external_credential()
+    assert hashes == [b"first test value", b"second test value", b"first test value"]
+
+    independent = E2ERuntime(make_config(tmp_path))
+    assert independent._fixture_password_cache is None
+    await independent._seed_external_credential()
+    assert hashes == [
+        b"first test value", b"second test value", b"first test value", b"first test value",
+    ]
+    assert independent._fixture_password_cache[1] != runtime._fixture_password_cache[1]
+
+
+@pytest.mark.asyncio
+async def test_failed_fixture_hash_is_not_cached(tmp_path, monkeypatch):
+    import bcrypt
+
+    runtime = E2ERuntime(make_config(tmp_path))
+    monkeypatch.setenv("TEST_USERNAME_ENV", "fixture-user")
+    monkeypatch.setenv("TEST_PASSWORD_ENV", "first test value")
+    _fixture_seed_database(monkeypatch)
+    hashes = _fixture_hash_spy(monkeypatch)
+    normal_hash = bcrypt.hashpw
+
+    def broken_hash(*_args):
+        raise ValueError("sensitive hash failure")
+
+    monkeypatch.setattr(bcrypt, "hashpw", broken_hash)
+    with pytest.raises(ProvisioningFailure) as raised:
+        await runtime._seed_external_credential()
+    assert "sensitive hash failure" not in str(raised.value)
+    assert runtime._fixture_password_cache is None
+    monkeypatch.setattr(bcrypt, "hashpw", normal_hash)
+    await runtime._seed_external_credential()
+    assert hashes == [b"first test value"]
+    assert runtime._fixture_password_cache is not None
+
+
+@pytest.mark.asyncio
+async def test_cancelled_fixture_hash_thread_cannot_populate_cache(tmp_path, monkeypatch):
+    import bcrypt
+    import threading
+
+    runtime = E2ERuntime(make_config(tmp_path))
+    monkeypatch.setenv("TEST_USERNAME_ENV", "fixture-user")
+    monkeypatch.setenv("TEST_PASSWORD_ENV", "first test value")
+    _fixture_seed_database(monkeypatch)
+    hashes = _fixture_hash_spy(monkeypatch)
+    normal_hash = bcrypt.hashpw
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+
+    def delayed_hash(value, salt):
+        entered.set()
+        try:
+            assert release.wait(timeout=5)
+            return normal_hash(value, salt)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(bcrypt, "hashpw", delayed_hash)
+    seed = asyncio.create_task(runtime._seed_external_credential())
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        seed.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await seed
+        assert runtime._fixture_password_cache is None
+    finally:
+        release.set()
+        assert await asyncio.to_thread(finished.wait, 5)
+    assert runtime._fixture_password_cache is None
+    monkeypatch.setattr(bcrypt, "hashpw", normal_hash)
+    await runtime._seed_external_credential()
+    assert hashes == [b"first test value", b"first test value"]
+    assert runtime._fixture_password_cache is not None
+
+
+@pytest.mark.asyncio
+async def test_reset_deadline_is_total_and_leaves_runtime_failed(tmp_path, monkeypatch):
+    runtime = _ready_runtime(tmp_path)
+    runtime.config = dataclasses.replace(runtime.config, timeout_seconds=0.02)
+    _, entered, _, _ = _stub_reuse_reset(monkeypatch, runtime, block_at="seed")
+    with pytest.raises((TimeoutError, ProvisioningFailure)):
+        await asyncio.wait_for(runtime.reset_scenario(), timeout=1)
+    assert entered.is_set()
+    assert runtime._lifecycle_state == "failed"
+    assert not runtime._prepared
+    assert runtime._dependency_reset_evidence["last_succeeded"] is False
+
+
+@pytest.mark.parametrize("state", ["starting", "resetting", "failed"])
+def test_live_backend_does_not_make_incomplete_fixture_ready(tmp_path, state):
+    runtime = _ready_runtime(tmp_path)
+    runtime._lifecycle_state = state
+    runtime._prepared = False
+    assert runtime.app_ready  # A live backend alone is insufficient.
+    assert runtime.fixture_health()["status"] == state
+    assert runtime.fixture_discovery()["status"] == state
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("detached_child", [False, True])
+async def test_process_termination_reaps_children_even_after_leader_exit_or_new_session(detached_child):
+    import os
+    import signal
+
+    # The ordinary-group case exits its leader before termination. The detached
+    # case keeps the leader alive so ownership of the separate session is known.
+    child_code = "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"
+    leader_code = (
+        "import subprocess,sys,time; "
+        f"child=subprocess.Popen([sys.executable,'-c',{child_code!r}], "
+        f"start_new_session={detached_child!r},stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); "
+        "print(child.pid,flush=True); "
+        + ("time.sleep(60)" if detached_child else "time.sleep(0.1)")
+    )
+    process = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", leader_code,
+        stdout=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
+    child_pid = int(await asyncio.wait_for(process.stdout.readline(), timeout=5))
+    try:
+        if not detached_child:
+            await asyncio.wait_for(process.wait(), timeout=5)
+        await asyncio.wait_for(terminate_process(process, grace_seconds=0.2), timeout=5)
+        status = subprocess.run(
+            ["ps", "-p", str(child_pid), "-o", "stat="],
+            capture_output=True, text=True, check=False,
+        ).stdout.strip()
+        assert not status or status.startswith("Z")
+        assert process.returncode is not None
+    finally:
+        for pid in (child_pid, process.pid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        await process.wait()
+
+
+@pytest.mark.asyncio
+async def test_failed_drain_retains_detached_child_ownership_for_cleanup(tmp_path, monkeypatch):
+    import os
+    import signal
+
+    runtime = E2ERuntime(dataclasses.replace(make_config(tmp_path), timeout_seconds=0.3))
+    child_code = (
+        "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "print('ready',flush=True); time.sleep(60)"
+    )
+    leader_code = (
+        "import signal,subprocess,sys,time\n"
+        "signal.signal(signal.SIGTERM, lambda *_args: sys.exit(0))\n"
+        f"child=subprocess.Popen([sys.executable,'-c',{child_code!r}], "
+        "start_new_session=True,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)\n"
+        "assert child.stdout.readline().strip()==b'ready'\n"
+        "child.stdout.close()\n"
+        "print(child.pid,flush=True)\n"
+        "while True: time.sleep(0.1)\n"
+    )
+    process = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", leader_code,
+        stdout=asyncio.subprocess.PIPE, start_new_session=True,
+    )
+    child_pid = int(await asyncio.wait_for(process.stdout.readline(), timeout=5))
+    managed = ManagedProcess(process)
+    runtime._children["backend"] = managed
+    original_terminate = e2e_runtime.terminate_process
+
+    async def terminate_with_short_grace(child, **kwargs):
+        assert child is process
+        assert kwargs["owned_groups"] is managed.owned_groups
+        await original_terminate(child, grace_seconds=0.2, **kwargs)
+
+    monkeypatch.setattr(e2e_runtime, "terminate_process", terminate_with_short_grace)
+    try:
+        with pytest.raises(TimeoutError):
+            await runtime._drain_backend()
+        assert process.returncode == 0
+        assert runtime._children["backend"] is managed
+        assert child_pid in managed.owned_groups
+        parent = subprocess.run(
+            ["ps", "-p", str(child_pid), "-o", "ppid="],
+            capture_output=True, text=True, check=False,
+        ).stdout.strip()
+        assert parent and int(parent) != process.pid
+
+        # The leader is gone and the child is reparented. A fresh descendant
+        # search misses it; cleanup must use the ownership remembered by drain.
+        await asyncio.wait_for(runtime._stop_named_process("backend"), timeout=5)
+        status = subprocess.run(
+            ["ps", "-p", str(child_pid), "-o", "stat="],
+            capture_output=True, text=True, check=False,
+        ).stdout.strip()
+        assert not status or status.startswith("Z")
+        assert "backend" not in runtime._children
+    finally:
+        for pid in (child_pid, process.pid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        await process.wait()
+
+
+@pytest.mark.asyncio
+async def test_backend_discovers_new_generation_config_from_its_working_directory(tmp_path):
+    config = make_config(tmp_path)
+    config.config_dir.mkdir(parents=True)
+    (config.config_dir / "generation.txt").write_text("old")
+    runtime = E2ERuntime(dataclasses.replace(config, storage_generation=1))
+    runtime.config.config_dir.mkdir(parents=True)
+    runtime.config.logs_dir.mkdir(parents=True)
+    (runtime.config.config_dir / "generation.txt").write_text("new")
+    command = [sys.executable, "-c", "from pathlib import Path; print(Path('config/generation.txt').read_text())"]
+    for name, expected in (("backend", "new"), ("embed", "old")):
+        await runtime._spawn_host_process(name, command, f"{name}.log")
+        process = runtime._children[name].process
+        assert await asyncio.wait_for(process.wait(), timeout=5) == 0
+        assert (runtime.config.logs_dir / f"{name}.log").read_text().strip() == expected
+
+
+@pytest.mark.asyncio
+async def test_concurrent_logged_commands_remain_owned_until_each_finishes(tmp_path, monkeypatch):
+    runtime = E2ERuntime(make_config(tmp_path))
+    first, second = _LifecycleProcess(), _LifecycleProcess()
+    processes = iter((first, second))
+    spawned = asyncio.Queue()
+
+    async def spawn(*args, **kwargs):
+        process = next(processes)
+        spawned.put_nowait(process)
+        return process
+
+    monkeypatch.setattr(e2e_runtime.asyncio, "create_subprocess_exec", spawn)
+    task1 = asyncio.create_task(runtime._run_logged_command(["first"], log_path=tmp_path / "first.log"))
+    assert await spawned.get() is first
+    task2 = asyncio.create_task(runtime._run_logged_command(["second"], log_path=tmp_path / "second.log"))
+    assert await spawned.get() is second
+    assert runtime._active_commands == {first, second}
+    first.release.set()
+    assert await task1 == 0
+    assert runtime._active_commands == {second}
+    second.release.set()
+    assert await task2 == 0
+    assert runtime._active_commands == set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("leader_exited", [False, True])
+async def test_cancelled_logged_command_retains_ownership_if_termination_fails(tmp_path, monkeypatch, leader_exited):
+    runtime = E2ERuntime(make_config(tmp_path))
+    process = _LifecycleProcess()
+    spawned = asyncio.Event()
+
+    async def spawn(*args, **kwargs):
+        spawned.set()
+        return process
+
+    async def fail_stop(child, *, owned_groups):
+        assert child is process
+        assert owned_groups == {process.pid}
+        if leader_exited:
+            process.returncode = 0  # A surviving descendant still requires ownership.
+        raise ProvisioningFailure("cannot stop child")
+
+    monkeypatch.setattr(e2e_runtime.asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(e2e_runtime, "terminate_process", fail_stop)
+    task = asyncio.create_task(runtime._run_logged_command(["blocked"], log_path=tmp_path / "blocked.log"))
+    await spawned.wait()
+    task.cancel()
+    with pytest.raises(ProvisioningFailure, match="cannot stop child"):
+        await task
+    assert process in runtime._active_commands
+
+
+@pytest.mark.asyncio
+async def test_cleanup_cancels_reset_before_tearing_down_resources(tmp_path, monkeypatch):
+    runtime = _ready_runtime(tmp_path)
+    entered = asyncio.Event()
+    operations = []
+
+    async def resetting():
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            # A reset cancellation handler must settle before cleanup touches
+            # resources which it could otherwise still recreate.
+            await asyncio.sleep(0)
+            operations.append("reset_settled")
+
+    async def stop_fixture():
+        assert runtime._reset_task.done()
+        operations.append("fixture_stop")
+
+    async def stop(name):
+        operations.append(f"stop:{name}")
+
+    async def compose(*args, **kwargs):
+        operations.append("compose_down")
+
+    monkeypatch.setattr(runtime, "_stop_fixture_control", stop_fixture)
+    monkeypatch.setattr(runtime, "_stop_named_process", stop)
+    monkeypatch.setattr(runtime, "_compose", compose)
+    runtime._reset_task = asyncio.create_task(resetting())
+    await entered.wait()
+    await runtime.cleanup()
+    assert runtime._reset_task.cancelled()
+    assert operations[0:2] == ["reset_settled", "fixture_stop"]
+    assert operations[-1] == "compose_down"
+    assert not runtime._prepared
+
+
+@pytest.mark.asyncio
+async def test_cleanup_continues_after_process_failure_and_can_retry(tmp_path, monkeypatch):
+    runtime = _ready_runtime(tmp_path)
+    for name in ("stdio", "frontend", "embed"):
+        runtime._children[name] = ManagedProcess(_LifecycleProcess())
+    backend = runtime._children["backend"]
+    operations = []
+    fail_backend = True
+
+    async def stop_fixture():
+        operations.append("fixture")
+
+    async def stop(name):
+        operations.append(name)
+        if name == "backend" and fail_backend:
+            raise ProvisioningFailure("injected termination failure")
+        runtime._children.pop(name, None)
+
+    async def compose(*args, **kwargs):
+        assert args == ("down", "--volumes", "--remove-orphans")
+        operations.append("down")
+        return 0
+
+    monkeypatch.setattr(runtime, "_stop_fixture_control", stop_fixture)
+    monkeypatch.setattr(runtime, "_stop_named_process", stop)
+    monkeypatch.setattr(runtime, "_compose", compose)
+    with pytest.raises(ProvisioningFailure, match="runtime cleanup incomplete:.*backend"):
+        await runtime.cleanup()
+    assert operations == ["fixture", "stdio", "frontend", "backend", "embed", "down"]
+    assert runtime._children == {"backend": backend}
+    assert not runtime._cleaned
+    assert not runtime._prepared
+
+    fail_backend = False
+    await runtime.cleanup()
+    assert runtime._cleaned
+    assert runtime._children == {}
+    assert operations.count("down") == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unexpected_sibling_exit", [False, True])
+async def test_supervisor_distinguishes_intentional_stop_from_unexpected_child_exit(tmp_path, monkeypatch, unexpected_sibling_exit):
+    runtime = _ready_runtime(tmp_path)
+    processes = {}
+    for name in ("backend", "embed"):
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, "-c", "import time; time.sleep(60)",
+            start_new_session=True,
+        )
+        processes[name] = process
+        runtime._children[name] = ManagedProcess(process)
+    original_terminate = e2e_runtime.terminate_process
+    backend_exited = asyncio.Event()
+    release_ownership = asyncio.Event()
+
+    async def delayed_termination(process, **kwargs):
+        await original_terminate(process, **kwargs)
+        if process is processes["backend"]:
+            backend_exited.set()
+            # Exercise the interval between OS exit and confirmed release of
+            # process ownership, which used to look like a backend crash.
+            await release_ownership.wait()
+
+    monkeypatch.setattr(e2e_runtime, "terminate_process", delayed_termination)
+    supervisor = asyncio.create_task(runtime._serve_foreground())
+    stop_backend = asyncio.create_task(runtime._stop_named_process("backend"))
+    try:
+        await asyncio.wait_for(backend_exited.wait(), timeout=5)
+        assert runtime._children["backend"].process is processes["backend"]
+        if unexpected_sibling_exit:
+            # Suppressing the intentional backend exit must not hide a
+            # simultaneous unexpected exit from a different owned child.
+            processes["embed"].terminate()
+            assert await asyncio.wait_for(supervisor, timeout=2) == 1
+        else:
+            await asyncio.sleep(0.15)
+            assert not supervisor.done()
+            release_ownership.set()
+            await stop_backend
+            runtime.request_stop()
+            assert await asyncio.wait_for(supervisor, timeout=2) == 0
+    finally:
+        release_ownership.set()
+        runtime.request_stop()
+        await asyncio.gather(stop_backend, supervisor, return_exceptions=True)
+        for process in processes.values():
+            await original_terminate(process, grace_seconds=0.2)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import uuid
+from unittest.mock import AsyncMock
 
 import asyncpg
 import pytest
@@ -13,6 +14,7 @@ from app.config import settings
 from app.config import AuthModeConfigurationError
 from app.exceptions import (
     AccountSuspendedError,
+    ConflictError,
     ExternalIdentityConflictError,
     MembershipRequiredError,
 )
@@ -160,6 +162,42 @@ async def test_exact_binding_does_not_require_email_claim(pool, monkeypatch):
 
     resolved = await _resolve_or_provision_keycloak_user(_claims("no-email-needed"))
     assert resolved["user_id"] == user_id
+
+
+async def test_bound_identity_sanitizes_upstream_display_name_without_blocking_login(
+    pool, monkeypatch
+):
+    from app.services.auth_service import _resolve_or_provision_keycloak_user
+
+    subject = f"long-name-{uuid.uuid4().hex[:8]}"
+    user_id = await _insert_bound_user(
+        pool,
+        subject=subject,
+        email=f"wsg-{subject}@example.com",
+    )
+    monkeypatch.setattr(settings, "keycloak_enrollment_mode", "invite_only", raising=False)
+    claims = _claims(subject)
+    claims["name"] = "  Alice\n" + ("A" * 120)
+
+    resolved = await _resolve_or_provision_keycloak_user(claims)
+
+    assert resolved["user_id"] == user_id
+    assert len(resolved["display_name"]) == 100
+    assert "\n" not in resolved["display_name"]
+
+
+async def test_jit_provisioning_sanitizes_upstream_display_name(pool):
+    from app.services.auth_service import _resolve_or_provision_keycloak_user
+
+    subject = f"jit-long-name-{uuid.uuid4().hex[:8]}"
+    claims = _claims(subject, f"wsg-{subject}@example.com")
+    claims["name"] = "  Alice\n" + ("B" * 120)
+
+    resolved = await _resolve_or_provision_keycloak_user(claims)
+
+    assert resolved["newly_provisioned"] is True
+    assert len(resolved["display_name"]) == 100
+    assert "\n" not in resolved["display_name"]
 
 
 @pytest.mark.parametrize("auth_provider", ["local", "keycloak"])
@@ -442,7 +480,7 @@ async def test_second_subject_cannot_jit_bind_to_an_already_bound_email(pool):
         await _resolve_or_provision_keycloak_user(_claims("subject-two", email))
 
 
-async def test_open_mode_rejects_username_collision_instead_of_suffixing(pool):
+async def test_open_mode_allocates_distinct_handle_on_username_collision(pool):
     from app.services.auth_service import _resolve_or_provision_keycloak_user
 
     username = f"wsg-username-{uuid.uuid4().hex[:8]}"
@@ -459,8 +497,135 @@ async def test_open_mode_rejects_username_collision_instead_of_suffixing(pool):
 
     claims = _claims("username-collision", f"{username}-new@example.com")
     claims["preferred_username"] = username
-    with pytest.raises(ExternalIdentityConflictError):
-        await _resolve_or_provision_keycloak_user(claims)
+    resolved = await _resolve_or_provision_keycloak_user(claims)
+
+    assert resolved["newly_provisioned"] is True
+    assert resolved["username"] != username
+    assert resolved["username"].startswith(f"{username}-")
+    async with pool.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT COUNT(*) FROM users WHERE username IN ($1, $2)",
+            username,
+            resolved["username"],
+        ) == 2
+
+
+@pytest.mark.parametrize("legacy_stem", ["Straße", "ΑΟΣ"])
+async def test_open_mode_detects_legacy_unicode_handle_with_database_lowercase(
+    pool, legacy_stem
+):
+    from app.services.auth_service import _resolve_or_provision_keycloak_user
+
+    existing_id = uuid.uuid4()
+    legacy_username = f"wsg-{legacy_stem}-{uuid.uuid4().hex[:6]}"
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO users (
+                id, username, email, password_hash, auth_provider,
+                account_status, account_kind
+            ) VALUES ($1, $2, $3, $4, 'local', 'active', 'human')
+            """,
+            existing_id,
+            legacy_username,
+            f"{uuid.uuid4().hex}@example.com",
+            "unused",
+        )
+        database_lower = await conn.fetchval("SELECT lower($1::text)", legacy_username)
+
+    claims = _claims(
+        f"unicode-collision-{uuid.uuid4().hex[:8]}",
+        f"wsg-unicode-{uuid.uuid4().hex[:8]}@example.com",
+    )
+    claims["preferred_username"] = legacy_username
+    resolved = await _resolve_or_provision_keycloak_user(claims)
+
+    assert resolved["newly_provisioned"] is True
+    assert resolved["user_id"] != existing_id
+    assert resolved["username"] != database_lower
+    assert resolved["username"].startswith(f"{database_lower}-")
+
+
+async def test_local_registration_rejects_exact_legacy_greek_handle(
+    pool, monkeypatch
+):
+    from app.services import auth_service
+
+    legacy_username = f"wsg-ΑΟΣ-{uuid.uuid4().hex[:6]}"
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO users (
+                id, username, email, password_hash, auth_provider,
+                account_status, account_kind
+            ) VALUES ($1, $2, $3, $4, 'local', 'active', 'human')
+            """,
+            uuid.uuid4(),
+            legacy_username,
+            f"{uuid.uuid4().hex}@example.com",
+            "unused",
+        )
+
+    monkeypatch.setattr(auth_service, "require_local_auth_enabled", lambda: None)
+    monkeypatch.setattr(
+        auth_service, "hash_password_async", AsyncMock(return_value="unused")
+    )
+    with pytest.raises(ConflictError):
+        await auth_service.register(
+            legacy_username,
+            f"wsg-register-{uuid.uuid4().hex}@example.com",
+            "password123",
+        )
+
+
+async def test_login_prefers_exact_database_canonical_handle_among_legacy_variants(
+    pool, monkeypatch
+):
+    from app.services import auth_service
+
+    suffix = uuid.uuid4().hex[:6]
+    mixed_username = f"wsg-Alice-{suffix}"
+    canonical_username = f"wsg-alice-{suffix}"
+    mixed_id = uuid.uuid4()
+    canonical_id = uuid.uuid4()
+    async with pool.acquire() as conn:
+        await conn.executemany(
+            """
+            INSERT INTO users (
+                id, username, email, password_hash, auth_provider,
+                account_status, account_kind
+            ) VALUES ($1, $2, $3, $4, 'local', 'active', 'human')
+            """,
+            [
+                (
+                    mixed_id,
+                    mixed_username,
+                    f"{uuid.uuid4().hex}@example.com",
+                    "mixed-hash",
+                ),
+                (
+                    canonical_id,
+                    canonical_username,
+                    f"{uuid.uuid4().hex}@example.com",
+                    "canonical-hash",
+                ),
+            ],
+        )
+
+    monkeypatch.setattr(auth_service, "require_local_auth_enabled", lambda: None)
+    def matches_fixture_hash(_password: str, password_hash: str) -> bool:
+        return password_hash == "canonical-hash"  # pragma: allowlist secret
+
+    monkeypatch.setattr(
+        auth_service,
+        "verify_password_async",
+        AsyncMock(side_effect=matches_fixture_hash),
+    )
+    monkeypatch.setattr(auth_service, "create_jwt", lambda *_args, **_kwargs: "token")
+
+    result = await auth_service.login(canonical_username.upper(), "password123")
+
+    assert result["user"]["id"] == str(canonical_id)
 
 
 async def test_suspended_bound_user_is_denied(pool, monkeypatch):

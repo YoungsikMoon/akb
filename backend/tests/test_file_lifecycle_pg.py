@@ -379,9 +379,11 @@ async def test_failed_inspection_only_cleans_failed_pending_upload(
             assert row["upload_state"] == "pending"
         else:
             assert row is None
-            assert await conn.fetchval(
-                "SELECT EXISTS(SELECT 1 FROM s3_delete_outbox WHERE s3_key=$1 AND processed_at IS NULL)", key,
+            cleanup = await conn.fetch(
+                "SELECT next_attempt_at > NOW() AS delayed FROM s3_delete_outbox "
+                "WHERE s3_key=$1 AND processed_at IS NULL ORDER BY next_attempt_at", key,
             )
+            assert [job["delayed"] for job in cleanup] == [False, True]
 
 
 async def test_confirmation_event_failure_rolls_back_transition(pool, vault_id, service, objects, monkeypatch):

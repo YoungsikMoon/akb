@@ -48,6 +48,8 @@ from app.services.resource_hash import (
 from app.services.s3_delete_worker import cancel_delete as _cancel_s3_delete
 from app.services.s3_delete_worker import enqueue_delete as _enqueue_s3_delete
 from app.services.s3_delete_worker import REPLACEMENT_STAGING_PREFIX, REPLACEMENT_STAGING_RETENTION_SECONDS
+
+from app.services.s3_delete_worker import enqueue_pending_upload_delete
 from app.services import skill_policy
 from app.services.uri_service import file_uri
 from app.services.m1_file_measurement import MeasurementFileService, measurement_enabled
@@ -290,20 +292,6 @@ def _file_version(row: dict) -> str | None:
     return row.get("storage_version") or row.get("etag")
 
 
-def _upload_confirmation_result(row: dict, vault_name: str | None) -> dict:
-    """The same response for a new confirmation and a non-mutating retry."""
-    return {
-        "kind": "file",
-        "uri": file_uri(vault_name, str(row["id"]), collection=row["collection"]) if vault_name else None,
-        "vault": vault_name,
-        **{key: row.get(key) for key in (
-            "name", "collection", "mime_type", "size_bytes", "content_hash",
-            "hash_algorithm", "etag", "storage_version",
-        )},
-        "version": _file_version(row),
-    }
-
-
 def _new_capability_token() -> str:
     """256 bits of URL-safe randomness. The token IS the capability, so it is
     never stored — only its digest is, the same way a password would be."""
@@ -496,6 +484,24 @@ def _file_envelope(row: dict, vault_name: str) -> dict:
         "description": row["description"],
         "created_by": row["created_by"],
         "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+    }
+
+
+def _upload_confirmation_envelope(row: dict, vault_name: str | None) -> dict:
+    """The same response for a new confirmation and a non-mutating retry."""
+    return {
+        "kind": "file",
+        "uri": file_uri(vault_name, str(row["id"]), collection=row["collection"]) if vault_name else None,
+        "vault": vault_name,
+        "name": row["name"],
+        "collection": row["collection"],
+        "mime_type": row["mime_type"],
+        "size_bytes": row["size_bytes"],
+        "content_hash": row["content_hash"],
+        "hash_algorithm": row["hash_algorithm"],
+        "etag": row["etag"],
+        "storage_version": row["storage_version"],
+        "version": _file_version(row),
     }
 
 
@@ -1077,7 +1083,7 @@ class FileService:
             ):
                 raise ConflictError("Confirmed file does not match the requested upload hash")
             vault_name = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
-            return _upload_confirmation_result(current, vault_name)
+            return _upload_confirmation_envelope(current, vault_name)
 
         async with pool.acquire() as conn:
             async with conn.transaction():
@@ -1125,7 +1131,7 @@ class FileService:
                     )
                     if not deleted:
                         raise ConflictError("Upload reservation changed during cleanup")
-                    await _enqueue_s3_delete(conn, row["s3_key"])
+                    await enqueue_pending_upload_delete(conn, row["s3_key"])
                 else:
                     size_bytes = meta["ContentLength"]
                     etag = (meta.get("ETag") or "").strip('"') or None
@@ -1163,7 +1169,7 @@ class FileService:
             logger.warning("file metadata indexing failed for %s: %s", file_id, e)
 
         logger.info("Upload confirmed: %s (%d bytes)", row["name"], row["size_bytes"])
-        return _upload_confirmation_result(row, vault_row["name"] if vault_row else None)
+        return _upload_confirmation_envelope(row, vault_row["name"] if vault_row else None)
 
     async def _record_upload_confirmation(
         self, conn, vault_id: uuid.UUID, fid: uuid.UUID, row: dict,
@@ -1192,6 +1198,25 @@ class FileService:
             name=row["name"], mime_type=row["mime_type"], content_hash=server_content_hash,
             byte_size=size_bytes, s3_key=row["s3_key"], actor=actor_id,
         )
+
+    async def cancel_upload(self, vault_id: uuid.UUID, file_id: str, *, actor_id: str) -> dict:
+        """Idempotent pending-only cleanup; never deletes a confirmed File."""
+        try:
+            fid = uuid.UUID(file_id)
+        except (ValueError, AttributeError):
+            raise ValidationError("file_id must be a UUID") from None
+        if self._measurement is not None:
+            return await self._measurement.cancel_upload(vault_id, file_id)
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                deleted = await vault_files_repo.delete_pending_file(conn, vault_id, fid)
+                if deleted:
+                    await enqueue_pending_upload_delete(conn, deleted["s3_key"])
+                    return {"cancelled": True, "state": "cancelled"}
+                existing = await vault_files_repo.find_by_id(conn, vault_id, fid)
+                confirmed = existing and existing.get("kind") == "file" and existing.get("upload_state") == "confirmed"
+                return {"cancelled": False, "state": "confirmed" if confirmed else "absent"}
 
     async def get_download_url(
         self, vault_id: uuid.UUID, file_id: str, *, actor_id: str | None = None,

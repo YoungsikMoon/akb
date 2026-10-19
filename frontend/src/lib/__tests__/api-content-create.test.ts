@@ -120,6 +120,12 @@ describe("Vault content creation contracts", () => {
           failure === "lost-response" ? HttpResponse.error() :
             HttpResponse.json({ detail: "Confirmation failed" }, { status: 409 }),
         ),
+        http.get(`*/api/v1/files/ops/${fileId}`, () =>
+          new HttpResponse(null, { status: 404 }),
+        ),
+        http.post(`*/api/v1/files/ops/${fileId}/cancel-upload`, () =>
+          HttpResponse.json({ cancelled: true, state: "cancelled" }),
+        ),
         http.delete(`*/api/v1/files/ops/${fileId}`, () => {
           deleted = true;
           return HttpResponse.json({ deleted: true });

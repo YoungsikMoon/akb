@@ -1719,40 +1719,28 @@ export async function uploadVaultFile(
     throw new Error("The server returned an incomplete upload reservation.");
   }
 
-  try {
-    if (!reservation.deduplicated) {
-      options.onStageChange?.("uploading");
-      const transfer = await fetch(reservation.upload_url, {
-        method: "PUT",
-        headers: { "Content-Type": mimeType },
-        body: file,
-      });
-      if (!transfer.ok) {
-        throw new Error(`File transfer failed (${transfer.status}).`);
-      }
+  if (!reservation.deduplicated) {
+    options.onStageChange?.("uploading");
+    const transfer = await fetch(reservation.upload_url, {
+      method: "PUT",
+      headers: { "Content-Type": mimeType },
+      body: file,
+    });
+    if (!transfer.ok) {
+      throw new Error(`File transfer failed (${transfer.status}).`);
     }
-
-    options.onStageChange?.("confirming");
-    const confirm = await authenticatedFetch(
-      `${API_BASE}/files/${encodeURIComponent(vault)}/${encodeURIComponent(fileId)}/confirm`,
-      { method: "POST" },
-    );
-    if (!confirm.ok) await throwJsonApiError(confirm);
-    return confirm.json();
-  } catch (error) {
-    // Best-effort rollback: pending reservations are otherwise cleaned by the
-    // backend worker, but immediate cleanup lets a user retry the same file now.
-    try {
-      await authenticatedFetch(
-        `${API_BASE}/files/${encodeURIComponent(vault)}/${encodeURIComponent(fileId)}`,
-        { method: "DELETE" },
-        { unauthorized: "preserve-session" },
-      );
-    } catch {
-      // The original transfer/confirmation error is the useful one to surface.
-    }
-    throw error;
   }
+
+  options.onStageChange?.("confirming");
+  const confirm = await authenticatedFetch(
+    `${API_BASE}/files/${encodeURIComponent(vault)}/${encodeURIComponent(fileId)}/confirm`,
+    { method: "POST" },
+  );
+  if (!confirm.ok) await throwJsonApiError(confirm);
+  // A lost response does not prove confirmation failed. General File DELETE
+  // here could remove a successfully published or concurrently replaced File.
+  // The backend owns cleanup of genuinely abandoned pending reservations.
+  return confirm.json();
 }
 
 export interface VaultFileDownloadResult {

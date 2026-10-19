@@ -129,6 +129,30 @@ def test_confirmed_original_upload_replay_cannot_overwrite_the_file(files):
     assert _bytes(files, fid) == original
 
 
+def test_original_confirmation_replay_preserves_published_replacement(files):
+    client, vault = files
+    original, updated = b"original confirmation", b"published replacement confirmation"
+    fid, initial, _ = _upload(files, original)
+    publication = client.post(
+        f"/api/v1/publications/{vault}/create",
+        json={"resource_type": "file", "uri": initial["uri"]},
+    )
+    assert publication.status_code == 200, publication.text
+    slug = publication.json()["slug"]
+    replacement = _replace(files, fid, updated)
+    assert _confirm(files, fid, replacement, updated).status_code == 200
+    stale = client.post(f"/api/v1/files/{vault}/{fid}/confirm", params={"content_hash": _hash(original)})
+    assert stale.status_code == 409, stale.text
+    for params in ({}, {"content_hash": _hash(updated)}):
+        replay = client.post(f"/api/v1/files/{vault}/{fid}/confirm", params=params)
+        assert replay.status_code == 200, replay.text
+        assert replay.json()["uri"] == initial["uri"]
+        assert replay.json()["content_hash"] == _hash(updated)
+    assert _bytes(files, fid) == updated
+    public_meta = _transfer("GET", f"{str(client.base_url).rstrip('/')}/api/v1/public/{slug}/meta")
+    assert public_meta.status_code == 200, public_meta.text
+
+
 def test_replacement_replay_failure_cannot_destroy_published_bytes(files):
     updated = b"published replacement"
     fid, _initial, _old = _upload(files, b"original for replay")

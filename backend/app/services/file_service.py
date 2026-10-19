@@ -47,6 +47,7 @@ from app.services.resource_hash import (
 )
 from app.services.s3_delete_worker import cancel_delete as _cancel_s3_delete
 from app.services.s3_delete_worker import enqueue_delete as _enqueue_s3_delete
+from app.services.s3_delete_worker import REPLACEMENT_STAGING_PREFIX, REPLACEMENT_STAGING_RETENTION_SECONDS
 from app.services import skill_policy
 from app.services.uri_service import file_uri
 from app.services.m1_file_measurement import MeasurementFileService, measurement_enabled
@@ -64,7 +65,7 @@ logger = logging.getLogger("akb.files")
 _PRESIGN_UPLOAD_TTL = 3600
 _PRESIGN_DOWNLOAD_TTL = 3600
 _S3_STREAM_CHUNK_SIZE = 64 * 1024
-_REPLACEMENT_STAGING_DELETE_DELAY = _PRESIGN_UPLOAD_TTL + 300
+_REPLACEMENT_STAGING_DELETE_DELAY = REPLACEMENT_STAGING_RETENTION_SECONDS
 _REPLACEMENT_CANDIDATE_DELETE_DELAY = 24 * 60 * 60
 
 _DELEGATED_ACTOR_EVENT_KEYS = (
@@ -262,7 +263,7 @@ def _replacement_staging_key(
     key.  Confirmation copies these bytes to a fresh, non-presigned key before
     publishing the metadata switch.
     """
-    return f"__akb_file_replacements__/{vault_name}/{file_id}/{replacement_id}"
+    return f"{REPLACEMENT_STAGING_PREFIX}{vault_name}/{file_id}/{replacement_id}"
 
 
 def _replacement_final_key(
@@ -287,6 +288,20 @@ def _replacement_final_key(
 def _file_version(row: dict) -> str | None:
     """Return the opaque optimistic-concurrency token exposed to callers."""
     return row.get("storage_version") or row.get("etag")
+
+
+def _upload_confirmation_result(row: dict, vault_name: str | None) -> dict:
+    """The same response for a new confirmation and a non-mutating retry."""
+    return {
+        "kind": "file",
+        "uri": file_uri(vault_name, str(row["id"]), collection=row["collection"]) if vault_name else None,
+        "vault": vault_name,
+        **{key: row.get(key) for key in (
+            "name", "collection", "mime_type", "size_bytes", "content_hash",
+            "hash_algorithm", "etag", "storage_version",
+        )},
+        "version": _file_version(row),
+    }
 
 
 def _new_capability_token() -> str:
@@ -1036,10 +1051,10 @@ class FileService:
         content_hash: str | None = None,
         hash_algorithm: str = HASH_ALGORITHM,
     ) -> dict:
-        """Confirm upload completion and persist AKB-certified byte hash.
+        """Certify a pending upload; confirmed retries never mutate the File.
 
-        If the file doesn't exist in S3 (upload failed/abandoned),
-        deletes the orphan DB record and returns an error.
+        Object I/O happens outside transactions. Every resulting mutation,
+        including failed-reservation cleanup, rechecks the current locked row.
         """
         if hash_algorithm != HASH_ALGORITHM:
             raise AKBError(
@@ -1054,152 +1069,129 @@ class FileService:
 
         fid = uuid.UUID(file_id)
         pool = await get_pool()
+
+        async def replay_result(conn, current: dict) -> dict:
+            if content_hash is not None and (
+                current.get("hash_verified_at") is None
+                or current.get("content_hash") != content_hash
+            ):
+                raise ConflictError("Confirmed file does not match the requested upload hash")
+            vault_name = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
+            return _upload_confirmation_result(current, vault_name)
+
         async with pool.acquire() as conn:
             async with conn.transaction():
                 row = await vault_files_repo.lease_file_upload_confirmation(
                     conn, vault_id, fid,
                 )
+                if row is None:
+                    row = await vault_files_repo.find_by_id_for_update(conn, vault_id, fid)
                 if not row:
                     raise NotFoundError("File", file_id)
+                if row["upload_state"] == "confirmed":
+                    return await replay_result(conn, row)
 
-        # Read object size. Treat NoSuchKey specially: that means the
-        # client never finished its presigned upload; clean up the
-        # orphan DB record so the same filename can be retried.
+        inspection_error: AKBError | None = None
         try:
-            meta = s3_adapter.head(row["s3_key"])
-            size_bytes = meta["ContentLength"]
+            meta = await asyncio.to_thread(s3_adapter.head, row["s3_key"])
+            server_content_hash = await asyncio.to_thread(
+                compute_stream_content_hash, s3_adapter.iter_chunks(row["s3_key"]),
+            )
         except NotFoundError:
-            async with pool.acquire() as conn:
-                # One transaction so the publication cannot outlive the row
-                # it points at — the same atomicity the delete paths need.
-                async with conn.transaction():
-                    await _delete_file_publications(conn, vault_id, file_id)
-                    await vault_files_repo.delete(conn, fid)
-            logger.warning("Orphan file record deleted: %s (S3 object missing)", file_id)
-            raise AKBError(
+            inspection_error = AKBError(
                 f"Upload not found in storage — file record cleaned up: {file_id}",
                 status_code=404,
             )
-
-        server_content_hash = await asyncio.to_thread(
-            compute_stream_content_hash,
-            s3_adapter.iter_chunks(row["s3_key"]),
-        )
-        # Two ways the stored bytes can fail to be what was declared: the
-        # caller's `content_hash` argument disagrees with them, or the key they
-        # were stored under is content-addressed and does not. The second check
-        # is what keeps a content-addressed key honest end to end — without it a
-        # caller could reserve some other content's key at `initiate_upload`,
-        # omit `content_hash` here, and leave unrelated bytes sitting where the
-        # next caller's idempotent upload would adopt them. Both are the same
-        # fault ("these are not the bytes you said") and take the same
-        # pre-existing 409 + cleanup path.
-        stored_bytes_disowned = (
-            (content_hash is not None and content_hash != server_content_hash)
-            or not _content_key_honors_hash(row["s3_key"], server_content_hash)
-        )
-        if stored_bytes_disowned:
-            async with pool.acquire() as conn:
-                async with conn.transaction():
-                    await _delete_file_publications(conn, vault_id, file_id)
-                    await vault_files_repo.delete(conn, fid)
-                    await _enqueue_s3_delete(conn, row["s3_key"])
-            raise AKBError(
-                "Uploaded file hash mismatch; file record was cleaned up.",
-                status_code=409,
-            )
-
-        etag = (meta.get("ETag") or "").strip('"') or None
-        storage_version = meta.get("VersionId")
+        else:
+            if (
+                (content_hash is not None and content_hash != server_content_hash)
+                or not _content_key_honors_hash(row["s3_key"], server_content_hash)
+            ):
+                inspection_error = ConflictError("Uploaded file hash mismatch; file record was cleaned up.")
 
         async with pool.acquire() as conn:
             async with conn.transaction():
-                confirmed = await vault_files_repo.confirm_file_upload_metadata(
-                    conn, fid, vault_id,
-                    size_bytes=size_bytes,
-                    content_hash=server_content_hash,
-                    hash_algorithm=HASH_ALGORITHM,
-                    etag=etag,
-                    storage_version=storage_version,
-                )
-                if not confirmed:
+                locked = await vault_files_repo.find_by_id_for_update(conn, vault_id, fid)
+                if locked is None:
                     raise NotFoundError("File", file_id)
+                if locked["upload_state"] == "confirmed":
+                    return await replay_result(conn, locked)
+                if locked["s3_key"] != row["s3_key"]:
+                    raise ConflictError("Upload reservation changed during confirmation")
+                if inspection_error is not None:
+                    await _delete_file_publications(conn, vault_id, file_id)
+                    deleted = await vault_files_repo.delete_failed_pending_file(
+                        conn, vault_id=vault_id, file_id=fid, expected_s3_key=row["s3_key"],
+                    )
+                    if not deleted:
+                        raise ConflictError("Upload reservation changed during cleanup")
+                    await _enqueue_s3_delete(conn, row["s3_key"])
+                else:
+                    size_bytes = meta["ContentLength"]
+                    etag = (meta.get("ETag") or "").strip('"') or None
+                    storage_version = meta.get("VersionId")
+                    confirmed = await vault_files_repo.confirm_file_upload_metadata(
+                        conn, fid, vault_id, expected_s3_key=row["s3_key"],
+                        size_bytes=size_bytes, content_hash=server_content_hash,
+                        hash_algorithm=HASH_ALGORITHM, etag=etag, storage_version=storage_version,
+                    )
+                    if not confirmed:
+                        raise ConflictError("Upload reservation changed during confirmation")
+                    # Use the final locked identity for events and projections,
+                    # not the pre-I/O collection/name snapshot.
+                    row = {
+                        **locked, "size_bytes": size_bytes, "content_hash": server_content_hash,
+                        "hash_algorithm": HASH_ALGORITHM, "etag": etag, "storage_version": storage_version,
+                    }
+                    await self._record_upload_confirmation(
+                        conn, vault_id, fid, row, actor_id, delegated_actor,
+                    )
                 vault_row = await conn.fetchrow(
                     "SELECT name FROM vaults WHERE id = $1", vault_id,
                 )
-                vault_name_for_event = vault_row["name"] if vault_row else None
-                await emit_event(
-                    conn, "file.put",
-                    vault_id=vault_id,
-                    resource_uri=(
-                        file_uri(
-                            vault_name_for_event,
-                            file_id,
-                            collection=row["collection"],
-                        )
-                        if vault_name_for_event else None
-                    ),
-                    actor_id=actor_id,
-                    payload={
-                        "vault": vault_name_for_event,
-                        "collection": row["collection"],
-                        "name": row["name"],
-                        "mime_type": row["mime_type"],
-                        "size_bytes": size_bytes,
-                        "content_hash": server_content_hash,
-                        "hash_algorithm": HASH_ALGORITHM,
-                        "etag": etag,
-                        "storage_version": storage_version,
-                        **_delegated_actor_event_fields(delegated_actor),
-                    },
-                )
-                await enqueue_native_file_projection(
-                    conn,
-                    file_id=fid,
-                    namespace_id=vault_id,
-                    collection=row["collection"],
-                    name=row["name"],
-                    mime_type=row["mime_type"],
-                    content_hash=server_content_hash,
-                    byte_size=size_bytes,
-                    s3_key=row["s3_key"],
-                    actor=actor_id,
-                )
+        # Raise only AFTER committing failed-pending cleanup.
+        if inspection_error is not None:
+            raise inspection_error
 
-        # Index file metadata for hybrid search.
         try:
             await index_file_metadata(
-                file_id,
-                vault_id=vault_id,
-                vault_name=vault_row["name"] if vault_row else "",
-                collection=row["collection"] or "",
-                name=row["name"],
-                mime_type=row["mime_type"],
-                size_bytes=size_bytes,
-                description=row["description"],
+                file_id, vault_id=vault_id, vault_name=vault_row["name"] if vault_row else "",
+                collection=row["collection"] or "", name=row["name"], mime_type=row["mime_type"],
+                size_bytes=row["size_bytes"], description=row["description"],
             )
         except Exception as e:  # noqa: BLE001
             logger.warning("file metadata indexing failed for %s: %s", file_id, e)
 
-        logger.info("Upload confirmed: %s (%d bytes)", row["name"], size_bytes)
+        logger.info("Upload confirmed: %s (%d bytes)", row["name"], row["size_bytes"])
+        return _upload_confirmation_result(row, vault_row["name"] if vault_row else None)
+
+    async def _record_upload_confirmation(
+        self, conn, vault_id: uuid.UUID, fid: uuid.UUID, row: dict,
+        actor_id: str, delegated_actor: dict[str, str] | None,
+    ) -> None:
+        """Record only the actual pending-to-confirmed transition in its TX."""
+        vault_row = await conn.fetchrow("SELECT name FROM vaults WHERE id = $1", vault_id)
+        file_id = str(fid)
+        size_bytes, server_content_hash = row["size_bytes"], row["content_hash"]
+        etag, storage_version = row["etag"], row["storage_version"]
         vault_name = vault_row["name"] if vault_row else None
-        return {
-            "kind": "file",
-            "uri": (
-                file_uri(vault_name, file_id, collection=row["collection"])
-                if vault_name else None
-            ),
-            "vault": vault_name,
-            "name": row["name"],
-            "collection": row["collection"],
-            "mime_type": row["mime_type"],
-            "size_bytes": size_bytes,
-            "content_hash": server_content_hash,
-            "hash_algorithm": HASH_ALGORITHM,
-            "etag": etag,
-            "storage_version": storage_version,
-            "version": storage_version or etag,
-        }
+        await emit_event(
+            conn, "file.put", vault_id=vault_id,
+            resource_uri=file_uri(vault_name, file_id, collection=row["collection"]) if vault_name else None,
+            actor_id=actor_id,
+            payload={
+                "vault": vault_name, "collection": row["collection"], "name": row["name"],
+                "mime_type": row["mime_type"], "size_bytes": size_bytes,
+                "content_hash": server_content_hash, "hash_algorithm": HASH_ALGORITHM,
+                "etag": etag, "storage_version": storage_version,
+                **_delegated_actor_event_fields(delegated_actor),
+            },
+        )
+        await enqueue_native_file_projection(
+            conn, file_id=fid, namespace_id=vault_id, collection=row["collection"],
+            name=row["name"], mime_type=row["mime_type"], content_hash=server_content_hash,
+            byte_size=size_bytes, s3_key=row["s3_key"], actor=actor_id,
+        )
 
     async def get_download_url(
         self, vault_id: uuid.UUID, file_id: str, *, actor_id: str | None = None,

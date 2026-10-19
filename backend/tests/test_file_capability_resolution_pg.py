@@ -34,6 +34,7 @@ _MIGRATIONS = (
     "019_s3_delete_outbox.py",
     "055_native_revision_m1_file_storage.py",
     "067_vault_file_upload_state.py",
+    "079_worker_claim_lifecycle.py",
     "104_file_write_capability_key.py",
 )
 
@@ -50,7 +51,9 @@ async def _can_connect(dsn: str) -> bool:
 @pytest_asyncio.fixture
 async def pool():
     if not await _can_connect(_DSN):
-        pytest.skip(f"Postgres not reachable at {_DSN}")
+        if os.getenv("REQUIRE_REAL_PG") == "1":
+            pytest.fail("Real PostgreSQL is required for File lifecycle tests")
+        pytest.skip("Postgres not reachable; set AKB_TEST_DSN for File lifecycle tests")
     pool = await asyncpg.create_pool(dsn=_DSN, min_size=1, max_size=4)
     backend_dir = Path(__file__).resolve().parents[1]
     async with pool.acquire() as conn:

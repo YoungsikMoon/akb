@@ -125,7 +125,7 @@ async def test_replay_never_repairs_revocation_or_identity_drift(lane, change):
         "email": ("UPDATE users SET email='other@example.test' WHERE id=$1", user),
         "external": ("INSERT INTO external_identities(user_id,issuer,subject) VALUES($1,'https://foreign.example','foreign')", user),
         "service-identity": ("INSERT INTO service_identities(user_id,issuer,client_id,subject) VALUES($1,'https://foreign.example','foreign','subject')", user),
-        "password": ("UPDATE users SET password_hash='changed' WHERE id=$1", user),
+        "password": ("UPDATE users SET password_hash='changed' WHERE id=$1", user),  # pragma: allowlist secret -- synthetic invalid password hash
         "required-action": ("UPDATE users SET credential_change_required=true WHERE id=$1", user),
         "token-hash": ("UPDATE tokens SET token_hash=repeat('0',64) WHERE id=$1", intent.token_id),
         "token-prefix": ("UPDATE tokens SET token_prefix='changed' WHERE id=$1", intent.token_id),

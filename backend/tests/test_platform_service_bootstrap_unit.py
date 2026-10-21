@@ -173,7 +173,7 @@ def test_runtime_guards_config_before_database(monkeypatch):
         monkeypatch.setattr(settings, key, value)
     assert bootstrap.runtime_identity()["auth_mode"] == "sso"
     for field, value in (("sso_session_epoch",None), ("auth_runtime_generation",0), ("keycloak_service_admin_client_id",""),
-                         ("keycloak_server_url","http://identity.example"), ("keycloak_server_url","https://name:secret@identity.example")):
+                         ("keycloak_server_url","http://identity.example"), ("keycloak_server_url","https://name:secret@identity.example")):  # pragma: allowlist secret -- intentionally rejected example URL
         with monkeypatch.context() as changed:
             changed.setattr(settings, field, value)
             with pytest.raises(bootstrap.BootstrapRefused):

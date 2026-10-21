@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS users (
     display_name TEXT,
     is_admin BOOLEAN NOT NULL DEFAULT false,
     is_recovery_admin BOOLEAN NOT NULL DEFAULT false,
+    sso_recovery_target_id UUID,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     -- JWT revocation cutoff. A JWT is rejected if its `iat` claim is
@@ -105,9 +106,17 @@ BEGIN
            AND table_name = 'users'
            AND column_name = 'is_recovery_admin'
     ) THEN
-        CREATE UNIQUE INDEX IF NOT EXISTS users_one_recovery_admin_per_provider
-            ON users (auth_provider)
-            WHERE is_recovery_admin;
+        IF EXISTS (SELECT 1 FROM information_schema.columns
+                    WHERE table_schema='public' AND table_name='users'
+                      AND column_name='sso_recovery_target_id') THEN
+            CREATE UNIQUE INDEX IF NOT EXISTS users_one_recovery_admin_per_provider
+                ON users (auth_provider) WHERE is_recovery_admin AND sso_recovery_target_id IS NULL;
+            CREATE UNIQUE INDEX IF NOT EXISTS users_one_recovery_admin_per_target
+                ON users (sso_recovery_target_id) WHERE is_recovery_admin AND sso_recovery_target_id IS NOT NULL;
+        ELSE
+            CREATE UNIQUE INDEX IF NOT EXISTS users_one_recovery_admin_per_provider
+                ON users (auth_provider) WHERE is_recovery_admin;
+        END IF;
     END IF;
 END $$;
 
@@ -1213,3 +1222,17 @@ CREATE UNIQUE INDEX IF NOT EXISTS sso_identity_operation_attempt_unique
 UPDATE sso_identity_operations p SET lineage_closed_at=p.retired_at
  WHERE p.parent_operation_id IS NULL AND p.retired_at IS NOT NULL AND p.lineage_closed_at IS NULL
    AND NOT EXISTS(SELECT 1 FROM sso_identity_operations c WHERE c.parent_operation_id=p.operation_id);
+-- Prepared target adoption (migration 124); source receipts remain untouched.
+CREATE TABLE IF NOT EXISTS prepared_sso_target_adoptions (
+    target_id UUID PRIMARY KEY,
+    operation_id UUID NOT NULL UNIQUE,
+    realm_id TEXT NOT NULL,
+    issuer TEXT NOT NULL,
+    profile TEXT NOT NULL,
+    config_sha256 TEXT NOT NULL CHECK (config_sha256 ~ '^[0-9a-f]{64}$'),
+    preparation_sha256 TEXT NOT NULL CHECK (preparation_sha256 ~ '^[0-9a-f]{64}$'),
+    akb_user_id UUID NOT NULL REFERENCES users(id),
+    retirement_receipt JSONB NOT NULL CHECK (jsonb_typeof(retirement_receipt)='object'),
+    host_preparation JSONB NOT NULL CHECK (jsonb_typeof(host_preparation)='object'),
+    adopted_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);

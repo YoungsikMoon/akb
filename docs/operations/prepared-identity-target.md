@@ -42,6 +42,13 @@ Create a private directory (0700) and JSON input (0600). The input is the typed
 Do not put these values in command arguments, shell history, application YAML,
 Kubernetes Jobs, or a Kubernetes Secret containing bootstrap authority.
 
+The one-time master client must issue access tokens with `exp - iat` at most
+600 seconds. Preparation and cleanup reject malformed, expired, future-issued,
+non-Bearer tokens or a master issuer different from the pinned public Keycloak
+root before target mutation. This check inspects only tokens acquired from the
+configured token endpoint; Keycloak authenticates their signatures and rights.
+It does not change the default standalone bootstrap token policy.
+
 ```sh
 python -m app.sso.prepare_target_host \
   --input-file /private/transition/host-input.json \

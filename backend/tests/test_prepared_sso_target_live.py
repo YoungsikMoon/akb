@@ -23,6 +23,7 @@ from cryptography.x509.oid import NameOID
 
 import asyncpg
 import httpx
+import jwt
 import pytest
 
 from app.sso.prepare_target_host import ApprovedProviderBootstrap, ExactCohortMember, ExistingTargetControl, prepare_target
@@ -33,6 +34,7 @@ from tests.test_prepared_sso_target_unit import preparation
 
 IMAGE = "quay.io/keycloak/keycloak:26.7.0@sha256:0f198be292568439d700cdbfb893e69a6009bb43a94a06a945b1d3d506c76b13"
 REMOTE_HOST = os.environ.get("AKB_PREPARED_TARGET_DOCKER_HOST", "")
+PG_PORT = int(os.environ.get("AKB_PREPARED_TARGET_PG_PORT", "55476"))
 pytestmark = [pytest.mark.asyncio, pytest.mark.skipif(os.environ.get("AKB_PREPARED_TARGET_REMOTE") != "1",
                                                    reason="requires explicit owned private Docker fixture")]
 
@@ -101,25 +103,25 @@ async def fixture():
                    data="".join(key + "=" + value + "\n" for key, value in values.items()).encode())
         remote("docker", "network", "create", prefix)
         network_created = True
+        resources.append(upstream_host)
         remote("docker", "run", "-d", "--name", upstream_host, "--network", prefix,
                "-v", private_dir + ":/fixture:ro", "python:3.14-alpine", "python", "/fixture/upstream.py")
-        resources.append(upstream_host)
-        remote("docker", "run", "-d", "--name", prefix + "-pg", "--network", prefix,
-               "--env-file", private_dir + "/pg.env", "-p", "127.0.0.1:55476:5432", "postgres:16")
         resources.append(prefix + "-pg")
+        remote("docker", "run", "-d", "--name", prefix + "-pg", "--network", prefix,
+               "--env-file", private_dir + "/pg.env", "-p", f"127.0.0.1:{PG_PORT}:5432", "postgres:16")
         for _ in range(60):
             try:
                 remote("docker", "exec", prefix + "-pg", "pg_isready", "-U", "fixture")
                 break
             except RuntimeError:
                 await __import__("asyncio").sleep(1)
+        resources.append(prefix + "-kc")
         remote("docker", "run", "-d", "--name", prefix + "-kc", "--network", prefix,
                "-v", private_dir + "/tls.crt:/fixture/tls.crt:ro",
                "--env-file", private_dir + "/kc.env", "-p", "127.0.0.1:55890:8080", IMAGE,
                "start-dev", "--hostname", "http://127.0.0.1:55890")
-        resources.append(prefix + "-kc")
         tunnel = subprocess.Popen(["ssh", "-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes", "-N",
-            "-L", "127.0.0.1:55890:127.0.0.1:55890", "-L", "127.0.0.1:55476:127.0.0.1:55476", REMOTE_HOST],
+            "-L", "127.0.0.1:55890:127.0.0.1:55890", "-L", f"127.0.0.1:{PG_PORT}:127.0.0.1:{PG_PORT}", REMOTE_HOST],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         async with httpx.AsyncClient(base_url="http://127.0.0.1:55890", timeout=20) as client:
             for _ in range(180):
@@ -136,7 +138,7 @@ async def fixture():
             assert response.status_code == 200
             admin = response.json()["access_token"]
             client.headers["Authorization"] = "Bearer " + admin
-            yield client, f"postgresql://fixture:{db_password}@127.0.0.1:55476/kc", upstream_issuer
+            yield client, f"postgresql://fixture:{db_password}@127.0.0.1:{PG_PORT}/kc", upstream_issuer
     finally:
         if tunnel is not None:
             tunnel.terminate()
@@ -191,6 +193,23 @@ async def test_real_keycloak_target_prepare_retirement_replay_and_pg_adoption(tm
     async with fixture() as (client, dsn, upstream_issuer):
         p = await setup_target(client, upstream_issuer)
         async with source_database(dsn, monkeypatch) as pg_source:
+            # Prove the HOST bound with a genuinely minted, signed Keycloak
+            # token, before any target client/profile mutation. Default OSS
+            # standalone bootstrap retains its independent token policy.
+            bootstrap = (await api(client, "GET", "master/clients?clientId=" + p.bootstrap_client_id))[0]
+            bootstrap["attributes"] = {**bootstrap.get("attributes", {}), "access.token.lifespan": "3600"}
+            await api(client, "PUT", "master/clients/" + bootstrap["id"], bootstrap, 204)
+            minted = await client.post("/realms/master/protocol/openid-connect/token", data={
+                "grant_type": "client_credentials", "client_id": p.bootstrap_client_id,
+                "client_secret": p.bootstrap_client_secret.get_secret_value()})
+            assert minted.status_code == 200
+            claims = jwt.decode(minted.json()["access_token"], options={"verify_signature": False})
+            assert claims["exp"] - claims["iat"] == 3600
+            with pytest.raises(RuntimeError, match="target_bootstrap_token_invalid"):
+                await prepare_target(p, tmp_path / "overlong")
+            assert await api(client, "GET", "akb/clients?clientId=" + p.api_client_id) == []
+            bootstrap["attributes"]["access.token.lifespan"] = "60"
+            await api(client, "PUT", "master/clients/" + bootstrap["id"], bootstrap, 204)
             # Refuse actual UUID mismatch before any profile/client/user mutation.
             wrong = p.model_copy(update={"realm_id": uuid4()})
             with pytest.raises(RuntimeError, match="target_realm_identity_mismatch"):

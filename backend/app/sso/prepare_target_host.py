@@ -23,6 +23,7 @@ from typing import Literal
 from urllib.parse import quote, urlsplit
 from uuid import UUID, uuid4
 
+import jwt
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
 from app.services.standalone_sso_bootstrap import (
@@ -232,6 +233,32 @@ class ExistingTargetControl(KeycloakStandaloneSSOControl):
         super().__init__(verify_ssl=preparation.verify_ssl)
         self.preparation = preparation
         self.resolved_cohort = list(preparation.cohort)
+
+    async def acquire_bootstrap(self, spec: StandaloneSSOBootstrapSpec) -> str | None:
+        token = await super().acquire_bootstrap(spec)
+        if token is None:
+            return None
+        # Only inspect a token returned by our configured master token endpoint.
+        # This bounds HOST authority; it does not authenticate a supplied JWT.
+        # Keycloak still verifies its signature/authorization on every API call.
+        try:
+            claims = jwt.decode(token, options={"verify_signature": False})
+        except jwt.InvalidTokenError:
+            raise fail("target_bootstrap_token_invalid") from None
+        issued, expires = claims.get("iat"), claims.get("exp")
+        public_root = self.preparation.issuer.rsplit("/realms/", 1)[0]
+        now = datetime.now(timezone.utc).timestamp()
+        if (
+            spec.keycloak_public_url != public_root
+            or claims.get("iss") != public_root + "/realms/master"
+            or claims.get("typ") != "Bearer"
+            or type(issued) is not int
+            or type(expires) is not int
+            or not 0 < expires - issued <= 600
+            or not issued <= now < expires
+        ):
+            raise fail("target_bootstrap_token_invalid")
+        return token
 
     async def configure_approved_provider(self, spec: StandaloneSSOBootstrapSpec) -> None:
         approved = self.preparation.provider

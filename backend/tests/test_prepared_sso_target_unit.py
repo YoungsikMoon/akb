@@ -4,14 +4,86 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import secrets
 from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+import httpx
+import jwt
 
 from app.services.standalone_sso_bootstrap import MANAGEMENT_REALM_ROLES, StandaloneSSOReadback
+from app.services.standalone_sso_keycloak import KeycloakStandaloneSSOControl
 from app.sso.prepare_target_host import ExistingTargetControl, HostPreparationInput, canonical, digest, protected_read, protected_write
 from app.sso.adopt_prepared_target import PreparedTargetReceipt, validate_runtime_binding
+
+
+def bootstrap_jwt(**changes):
+    now = int(datetime.now(timezone.utc).timestamp())
+    claims = {"iat": now, "exp": now + 60, "typ": "Bearer", "iss": "https://identity.example/realms/master"}
+    claims.update(changes)
+    return jwt.encode(claims, secrets.token_bytes(32), algorithm="HS256")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["malformed", "long", "expired", "future", "zero", "wrong_type", "wrong_issuer", "missing_iat", "bool_exp"])
+async def test_target_bootstrap_rejects_invalid_endpoint_tokens_before_admin_calls(case):
+    now = int(datetime.now(timezone.utc).timestamp())
+    tokens = {"malformed": "not-a-jwt", "long": bootstrap_jwt(exp=now + 3600),
+              "expired": bootstrap_jwt(iat=now - 120, exp=now - 60),
+              "future": bootstrap_jwt(iat=now + 60, exp=now + 120),
+              "zero": bootstrap_jwt(exp=now), "wrong_type": bootstrap_jwt(typ="ID"),
+              "wrong_issuer": bootstrap_jwt(iss="https://foreign.example/realms/master"),
+              "missing_iat": bootstrap_jwt(iat=None), "bool_exp": bootstrap_jwt(exp=True)}
+    p = preparation()
+    requests = []
+
+    def endpoint(request):
+        requests.append((request.method, request.url.path))
+        return httpx.Response(200, json={"access_token": tokens[case]})
+
+    control = ExistingTargetControl(p)
+    control._clients[p.internal_url] = httpx.AsyncClient(base_url=p.internal_url, transport=httpx.MockTransport(endpoint))
+    try:
+        with pytest.raises(RuntimeError, match="target_bootstrap_token_invalid"):
+            await control.acquire_bootstrap(p.spec())
+        assert requests == [("POST", "/realms/master/protocol/openid-connect/token")]
+    finally:
+        await control.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lifetime", [60, 600, None])
+async def test_target_bootstrap_accepts_bounded_endpoint_token_or_retired_authority(lifetime):
+    p = preparation()
+    now = int(datetime.now(timezone.utc).timestamp())
+    token = bootstrap_jwt(iat=now, exp=now + lifetime) if lifetime is not None else None
+    requests = []
+
+    def endpoint(request):
+        requests.append((request.method, request.url.path))
+        return httpx.Response(200, json={"access_token": token}) if token else httpx.Response(401)
+
+    control = ExistingTargetControl(p)
+    control._clients[p.internal_url] = httpx.AsyncClient(base_url=p.internal_url, transport=httpx.MockTransport(endpoint))
+    try:
+        assert await control.acquire_bootstrap(p.spec()) == token
+        assert requests == [("POST", "/realms/master/protocol/openid-connect/token")]
+    finally:
+        await control.aclose()
+
+
+@pytest.mark.asyncio
+async def test_default_standalone_bootstrap_token_policy_is_unchanged():
+    p = preparation()
+    token = bootstrap_jwt(exp=int(datetime.now(timezone.utc).timestamp()) + 3600)
+    control = KeycloakStandaloneSSOControl()
+    control._clients[p.internal_url] = httpx.AsyncClient(base_url=p.internal_url,
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"access_token": token})))
+    try:
+        assert await control.acquire_bootstrap(p.spec()) == token
+    finally:
+        await control.aclose()
 
 
 def preparation(**changes):

@@ -236,7 +236,7 @@ async def test_target_migration_upgrades_alias_namespace_idempotently(lane):  # 
         await conn.execute("ALTER TABLE sso_provider_ownership DROP COLUMN target_id CASCADE")
         await conn.execute("ALTER TABLE sso_provider_ownership ADD PRIMARY KEY(alias)")
         await conn.execute("ALTER TABLE sso_operation_installation DROP COLUMN legacy_target_id, DROP COLUMN legacy_issuer")
-        migration = _load_migration("117_sso_management_targets.py")
+        migration = _load_migration("122_sso_management_targets.py")
         await migration.migrate(conn=conn)
         target_id = await conn.fetchval("SELECT target_id FROM sso_provider_ownership WHERE alias='workforce'")
         await migration.migrate(conn=conn)

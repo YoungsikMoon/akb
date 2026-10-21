@@ -36,7 +36,7 @@ async def lane(monkeypatch):
         from app.db.postgres import _load_migration
 
         admission_migration = _load_migration("082_pending_admissions.py")
-        operation_migration = _load_migration("116_sso_identity_operations.py")
+        operation_migration = _load_migration("121_sso_identity_operations.py")
         assert admission_migration is not None
         assert operation_migration is not None
         async with pool.acquire() as conn:

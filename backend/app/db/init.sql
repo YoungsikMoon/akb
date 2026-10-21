@@ -1079,7 +1079,7 @@ CREATE TABLE IF NOT EXISTS sso_account_sync_state (
     suspended INTEGER NOT NULL DEFAULT 0
 );
 
--- Bounded SSO identity operations (migration 116).
+-- Bounded SSO identity operations (migration 121).
 -- An installation UUID belongs to this database, independently of revision backend.
 CREATE TABLE IF NOT EXISTS sso_operation_installation (
     singleton BOOLEAN PRIMARY KEY DEFAULT true CHECK (singleton),

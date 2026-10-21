@@ -27,6 +27,7 @@ Capabilities return `schema_version: 1`, the database-owned `installation_id`,
 - `sso.enabled-exact-admission.v1`
 - `sso.preparation-target.v1`
 - `auth.callback-login-evidence.v1`
+- `sso.operation-attempts.v1`
 
 `realm_identity` is `{realm_id, realm_name, issuer}` from an actual Admin REST
 read of the configured realm. Missing permission, delegated management and
@@ -265,6 +266,55 @@ schema1, supported behavior names and the actual active source tuple. Source
 revision is the baked full40-character SHA or null; a product version is never
 substituted. This endpoint cannot attest to its own image provenance or Pod
 digest, which remain deployment-owned evidence.
+
+## Fresh authority after an interrupted attempt
+
+Authority never refreshes automatically. An expired nonce or credential requires
+another explicit human approval. Read the root operation's `intent_sha256`, then
+POST `/admin/sso/identity-operations/{root_operation_id}/authority-grants` using
+the current human product-admin ceremony (CSRF for cookie-backed SSO):
+
+```json
+{
+  "operation_id": "<fresh child authority UUID>",
+  "expected_intent_sha256": "<root immutable intent hash>",
+  "ttl_seconds": 600
+}
+```
+
+No actor, cohort, payload, target or source override is accepted. The backend
+derives those values from the original root grant, verifies the exact current
+runtime and fresh ownership/readback, and checks the live actor token and new
+granting human. Under the original SOURCE it permits the original approved verbs
+(`authority_scope: source-recovery`). Under the explicitly bound future TARGET it
+permits only `login-evidence`, readback and retirement (`target-evidence`). The
+original source tuple is retained, never rewritten to describe the target.
+
+A successful response contains the one-time credential and the root
+`parent_operation_id`, unchanged `intent_sha256` and monotonic
+`authority_attempt`. Issuance atomically retires previous credentials. Concurrent
+human approvals leave only the newest attempt live. The controller must CAS its
+canonical credential receipt by parent/intent/attempt; a late earlier response
+must not replace a newer credential. Lost credential responses require another
+human attempt, because plaintext credentials are never stored. Every attempt
+has its own nonce namespace; an old nonce is never given a fresh timestamp.
+
+Status can be read by the exact original actor service PAT even after expiry or
+supersession. This metadata read is not execution or renewal authority. New
+children cannot be issued after explicit retirement closes the lineage. Visible
+drift, ownership/revision changes, emergency disable, changed targets or a revoked
+actor token block reauthorization and require separate human reconciliation.
+
+Status additionally reports live `owned_binding_ids` (external-identity row
+UUIDs), `owned_binding_count`, committed `rollback_results` and fresh nullable
+provider state/fingerprint/secret revision or a safe `provider_readback_error`.
+A SOURCE child can compensate only exact row UUIDs inserted anywhere in its
+immutable lineage. A subsequently recreated row is not owned and is preserved.
+Rollback does not restore independently revoked PATs, changed ACLs or other
+administrative decisions. These fields do not prove comprehensive abort: no
+Keycloak user/link deletion, provider cleanup or broad PAT/ACL restoration is
+claimed. A controller must block an unproven abort or use an independently
+verified host compensation ceremony; it cannot turn caller flags into evidence.
 
 ## Trust boundary and artifact evidence
 

@@ -162,6 +162,16 @@ class ProviderResultResponse(RequestModel):
 class StatusResponse(RequestModel):
     schema_version: Literal[1]
     target_id: uuid.UUID
+    parent_operation_id: uuid.UUID | None
+    intent_sha256: str
+    authority_attempt: int
+    owned_binding_ids: list[uuid.UUID]
+    owned_binding_count: int
+    rollback_results: list[IdentityResultResponse]
+    provider_state: str | None
+    provider_fingerprint: str | None
+    provider_readback_error: str | None
+    provider_secret_revision: str | None
     source_tuple: SourceTuple | None
     target_epoch: str | None
     phase: Literal["granted", "preparing", "prepared", "retired"]
@@ -217,9 +227,11 @@ def operation_credential(authorization: str | None) -> str | None:
 @router.get("/admin/sso/identity-operations/{operation_id}", response_model=StatusResponse)
 async def operation_status(operation_id: uuid.UUID, request: Request, authorization: str | None = Header(default=None)):
     credential = operation_credential(authorization)
+    actor = None
     if credential is None:
-        await get_current_product_admin(request, authorization=authorization)
-    return await operations.status(operation_id, credential=credential)
+        resolved = await get_metadata_actor(request, authorization=authorization)
+        actor = resolved if getattr(resolved, "account_kind", "human") == "service" else None
+    return await operations.status(operation_id, credential=credential, actor=actor)
 
 
 @router.post("/admin/sso/identity-operations/{operation_id}/retire", response_model=StatusResponse)
@@ -364,3 +376,25 @@ async def operation_login_events(operation_id: uuid.UUID, akb_user_id: uuid.UUID
     actor = None if credential else await get_metadata_actor(request, authorization=authorization)
     response.headers["Cache-Control"] = "no-store"
     return await events(operation_id, challenge_id, akb_user_id, credential=credential, actor=actor)
+
+
+class AuthorityGrantRequest(RequestModel):
+    operation_id: uuid.UUID
+    expected_intent_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    ttl_seconds: int = Field(ge=1, le=600, strict=True)
+
+
+class AuthorityGrantResponse(GrantResponse):
+    parent_operation_id: uuid.UUID
+    intent_sha256: str
+    authority_attempt: int
+    authority_scope: Literal["source-recovery", "target-evidence"]
+
+
+@router.post("/admin/sso/identity-operations/{parent_operation_id}/authority-grants", response_model=AuthorityGrantResponse)
+async def reauthorize_operation(parent_operation_id: uuid.UUID, request: AuthorityGrantRequest, response: Response,
+                                 actor: ProductAdminActor = Depends(get_product_admin_mutation)):
+    from app.sso.operation_attempts import reauthorize
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    return await reauthorize(parent_operation_id, **request.model_dump(), granted_by=uuid.UUID(str(actor.user_id)))

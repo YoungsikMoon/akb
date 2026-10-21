@@ -413,6 +413,7 @@ async def _apply_pending_migrations(conn, applied: set[str]) -> None:
         "116_sso_identity_operations.py",  # exact short-lived migration authority and provider ownership
         "117_sso_management_targets.py",
         "118_sso_callback_evidence.py",
+        "125_sso_operation_attempts.py",
     ):
         if filename in applied:
             continue

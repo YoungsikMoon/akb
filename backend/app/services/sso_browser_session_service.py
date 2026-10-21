@@ -336,6 +336,12 @@ async def create_sso_browser_session(
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
+            if callback_challenge_id is not None:
+                from app.sso.callback_evidence import lock_callback_authority
+                try:
+                    await lock_callback_authority(conn, callback_challenge_id)
+                except AKBError:
+                    raise AuthenticationError("SSO login evidence is unavailable") from None
             await lock_active_sso_session_epoch(conn, authority)
             await conn.execute(
                 "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
@@ -450,7 +456,6 @@ async def create_sso_browser_session(
             )
             if callback_challenge_id is not None:
                 from app.sso.callback_evidence import record_callback
-                from app.exceptions import AKBError
                 try:
                     await record_callback(conn, callback_challenge_id, user_id=user_id,
                                           issuer=issuer, subject=subject, provider_alias=provider_alias)

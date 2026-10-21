@@ -47,16 +47,27 @@ async def issue_challenge(operation_id, credential, user_id, request_id=None):
                 "login_url": f"{settings.public_base_url.rstrip('/')}/api/v1/auth/sso/{row['provider_alias']}/login?{urlencode({'login_challenge': raw})}"}
 
 
+async def lock_callback_authority(conn, challenge_id):
+    initial = await conn.fetchrow("SELECT * FROM sso_operation_login_challenges WHERE challenge_id=$1", challenge_id)
+    if initial is None:
+        raise ops._error("sso_login_challenge_invalid", 401)
+    row = await ops._lock_operation(conn, initial["operation_id"])
+    challenge = await conn.fetchrow("SELECT * FROM sso_operation_login_challenges WHERE challenge_id=$1 FOR UPDATE", challenge_id)
+    return row, challenge
+
+
 async def browser_challenge(raw, alias):
     if not isinstance(raw, str) or not 32 <= len(raw) <= 128:
         raise ops._error("sso_login_challenge_invalid", 401)
     pool = await ops.get_pool()
     async with pool.acquire() as conn, conn.transaction():
-        challenge = await conn.fetchrow("SELECT * FROM sso_operation_login_challenges WHERE credential_hash=$1 FOR UPDATE",
+        challenge = await conn.fetchrow("SELECT * FROM sso_operation_login_challenges WHERE credential_hash=$1",
                                        hashlib.sha256(raw.encode()).hexdigest())
         if challenge is None or challenge["consumed_at"] or challenge["expires_at"] <= await conn.fetchval("SELECT clock_timestamp()"):
             raise ops._error("sso_login_challenge_invalid", 401)
-        row = await conn.fetchrow("SELECT * FROM sso_identity_operations WHERE operation_id=$1 FOR UPDATE", challenge["operation_id"])
+        row, challenge = await lock_callback_authority(conn, challenge["challenge_id"])
+        if challenge["consumed_at"] or challenge["expires_at"] <= await conn.fetchval("SELECT clock_timestamp()"):
+            raise ops._error("sso_login_challenge_invalid", 401)
         await _callback_context(conn, row, challenge["akb_user_id"], alias)
         return str(challenge["challenge_id"])
 
@@ -80,11 +91,10 @@ async def _callback_context(conn, row, user_id, alias):
 
 async def record_callback(conn, challenge_id, *, user_id, issuer, subject, provider_alias):
     """Internal session-transaction hook; never mounted as an HTTP writer."""
-    challenge = await conn.fetchrow("SELECT * FROM sso_operation_login_challenges WHERE challenge_id=$1 FOR UPDATE", challenge_id)
+    row, challenge = await lock_callback_authority(conn, challenge_id)
     if (challenge is None or challenge["akb_user_id"] != user_id or challenge["consumed_at"] is not None
         or challenge["expires_at"] <= await conn.fetchval("SELECT clock_timestamp()")):
         raise ops._error("sso_login_challenge_invalid", 401)
-    row = await conn.fetchrow("SELECT * FROM sso_identity_operations WHERE operation_id=$1 FOR UPDATE", challenge["operation_id"])
     target, item = await _callback_context(conn, row, user_id, provider_alias)
     if (issuer, subject) != (target.issuer, item["broker_subject"]):
         raise ops._error("sso_login_challenge_binding_unavailable", 403)
@@ -134,10 +144,9 @@ async def events(operation_id, challenge_id, user_id, *, credential=None, actor=
 async def verify_callback(challenge_id, *, issuer, subject, provider_alias):
     pool = await ops.get_pool()
     async with pool.acquire() as conn, conn.transaction():
-        challenge = await conn.fetchrow("SELECT * FROM sso_operation_login_challenges WHERE challenge_id=$1 FOR UPDATE", challenge_id)
+        row, challenge = await lock_callback_authority(conn, challenge_id)
         if challenge is None or challenge["consumed_at"] or challenge["expires_at"] <= await conn.fetchval("SELECT clock_timestamp()"):
             raise ops._error("sso_login_challenge_invalid", 401)
-        row = await conn.fetchrow("SELECT * FROM sso_identity_operations WHERE operation_id=$1 FOR UPDATE", challenge["operation_id"])
         target, item = await _callback_context(conn, row, challenge["akb_user_id"], provider_alias)
         if (issuer, subject) != (target.issuer, item["broker_subject"]):
             raise ops._error("sso_login_challenge_binding_unavailable", 403)

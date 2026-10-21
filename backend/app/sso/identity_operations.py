@@ -31,6 +31,7 @@ CAPABILITIES = [
     "sso.enabled-exact-admission.v1",
     "sso.preparation-target.v1",
     "auth.callback-login-evidence.v1",
+    "sso.operation-attempts.v1",
 ]
 IDENTITY_VERBS = frozenset({"preflight", "postcheck", "apply", "rollback", "admit"})
 EVIDENCE_VERBS = frozenset({"login-evidence"})
@@ -251,6 +252,8 @@ async def grant(spec: dict[str, Any], *, granted_by: uuid.UUID) -> dict[str, Any
             raise _error("sso_operation_runtime_conflict")
         target_tuple = {"auth_mode": "sso", "issuer": target.issuer, "runtime_generation": target_generation,
                         "sso_session_epoch": target_epoch, "source_revision": spec.get("expected_target_source_revision", expected_source["source_revision"])}
+        if target_tuple != expected_source and target_generation <= expected_source["runtime_generation"]:
+            raise _error("sso_operation_runtime_conflict")
         await _alias_lock(conn, spec["provider_alias"], target)
         await lock_source(conn, expected_source)
         owner = await conn.fetchrow("SELECT * FROM sso_provider_ownership WHERE alias=$1 AND target_id=$2 FOR UPDATE", spec["provider_alias"], target.target_id)
@@ -346,7 +349,8 @@ async def _execute_provider(conn, row, request, request_hash, actor_expires_at, 
     await conn.execute("""UPDATE sso_provider_ownership SET revision=$2,fingerprint=$3,
         updated_by=$4,updated_at=NOW() WHERE alias=$1 AND target_id=$5""", row["provider_alias"], revision, fingerprint, row["actor_id"], target.target_id)
     await conn.execute("""UPDATE sso_identity_operations SET current_provider_revision=$2,
-        current_provider_fingerprint=$3,phase=CASE WHEN prepared_identity_ids_hash IS NOT NULL THEN 'prepared' ELSE 'preparing' END WHERE operation_id=$1""", row["operation_id"], revision, fingerprint)
+        current_provider_fingerprint=$3,phase=CASE WHEN retired_at IS NOT NULL THEN 'retired' WHEN prepared_identity_ids_hash IS NOT NULL THEN 'prepared' ELSE 'preparing' END
+        WHERE operation_id=$1 OR operation_id=$4""", row["operation_id"], revision, fingerprint, row["parent_operation_id"])
     result = {"schema_version": 1, "operation_id": str(row["operation_id"]), "nonce": str(request["nonce"]),
               "verb": verb, "provider_revision": revision, "provider": mutation.after.admin_view()}
     await conn.execute("""INSERT INTO sso_identity_operation_requests(operation_id,nonce,request_sha256,result)
@@ -358,13 +362,31 @@ async def _execute_provider(conn, row, request, request_hash, actor_expires_at, 
     return result
 
 
+async def _lock_operation(conn, operation_id):
+    root_id = await conn.fetchval("SELECT COALESCE(parent_operation_id,operation_id) FROM sso_identity_operations WHERE operation_id=$1", operation_id)
+    if root_id is None:
+        return None
+    root = await conn.fetchrow("SELECT * FROM sso_identity_operations WHERE operation_id=$1 FOR UPDATE", root_id)
+    return root if root_id == operation_id else await conn.fetchrow("SELECT * FROM sso_identity_operations WHERE operation_id=$1 FOR UPDATE", operation_id)
+
+
+async def _binding_ids(conn, row, *, item_index=None, existing_only=False):
+    root_id = row["parent_operation_id"] or row["operation_id"]
+    return await conn.fetch("""SELECT DISTINCT b.identity_id FROM sso_identity_operation_bindings b
+        JOIN sso_identity_operations o ON o.operation_id=b.operation_id
+        LEFT JOIN external_identities e ON e.id=b.identity_id
+        WHERE (o.operation_id=$1 OR o.parent_operation_id=$1)
+        AND ($2::integer IS NULL OR b.item_index=$2)
+        AND (NOT $3::boolean OR e.id IS NOT NULL) ORDER BY b.identity_id""", root_id, item_index, existing_only)
+
+
 async def execute(operation_id: uuid.UUID, credential: str, request: dict[str, Any]) -> dict[str, Any]:
     if not credential.startswith(PREFIX) or len(credential) > 256:
         raise _error("sso_operation_credential_invalid", 401)
     request_hash = _digest({**request, "nonce": str(request["nonce"]), "issued_at": request["issued_at"].isoformat()})
     pool = await get_pool()
     async with pool.acquire() as conn, conn.transaction():
-        row = await conn.fetchrow("SELECT * FROM sso_identity_operations WHERE operation_id=$1 FOR UPDATE", operation_id)
+        row = await _lock_operation(conn, operation_id)
         if row is None or not secrets.compare_digest(row["credential_hash"], hashlib.sha256(credential.encode()).hexdigest()):
             raise _error("sso_operation_credential_invalid", 401)
         await _check_window(conn, row, request)
@@ -424,11 +446,11 @@ async def execute(operation_id: uuid.UUID, credential: str, request: dict[str, A
                 operation_id, index, identity_id)
             state, changed = "linked", True
         elif verb == "rollback":
-            owned = await conn.fetchval("SELECT identity_id FROM sso_identity_operation_bindings WHERE operation_id=$1 AND item_index=$2", operation_id, index)
-            if state == "linked" and owned is None:
+            owned = [item["identity_id"] for item in await _binding_ids(conn, row, item_index=index)]
+            if state == "linked" and not owned:
                 raise _error("sso_operation_binding_not_owned")
-            if owned is not None:
-                deleted = await conn.fetchval("""DELETE FROM external_identities WHERE id=$1 AND user_id=$2
+            if owned:
+                deleted = await conn.fetchval("""DELETE FROM external_identities WHERE id=ANY($1::uuid[]) AND user_id=$2
                     AND issuer=$3 AND subject=$4 RETURNING id""", owned, uid, prelink.broker_issuer, item["broker_subject"])
                 changed = deleted is not None
                 if state == "linked" and not changed:
@@ -473,7 +495,7 @@ def _credential_valid(row, credential):
 
 
 async def authorize_read(conn, operation_id, credential, *, allow_retired=False):
-    row = await conn.fetchrow("SELECT * FROM sso_identity_operations WHERE operation_id=$1 FOR UPDATE", operation_id)
+    row = await _lock_operation(conn, operation_id)
     _credential_valid(row, credential)
     now = await conn.fetchval("SELECT clock_timestamp()")
     if (row["retired_at"] is not None and not allow_retired) or row["expires_at"] <= now:
@@ -481,7 +503,8 @@ async def authorize_read(conn, operation_id, credential, *, allow_retired=False)
     await _live_actor(conn, row)
     await _bound_target(conn, row)
     await _read_boundary(conn, row)
-    # Lock waits may consume the remaining lifetime.
+    # Lock waits may consume the remaining operation or actor lifetime.
+    await _live_actor(conn, row)
     if row["expires_at"] <= await conn.fetchval("SELECT clock_timestamp()"):
         raise _error("sso_operation_retired", 403)
     return row
@@ -509,7 +532,7 @@ async def _postcheck(conn, row, target):
         _digest(sorted(linked)) if prepared else None)
 
 
-async def status(operation_id: uuid.UUID, *, credential: str | None = None) -> dict[str, Any]:
+async def status(operation_id: uuid.UUID, *, credential: str | None = None, actor=None) -> dict[str, Any]:
     pool = await get_pool()
     async with pool.acquire() as conn, conn.transaction():
         if credential is not None:
@@ -518,8 +541,29 @@ async def status(operation_id: uuid.UUID, *, credential: str | None = None) -> d
             row = await conn.fetchrow("SELECT * FROM sso_identity_operations WHERE operation_id=$1", operation_id)
             if row is None:
                 raise _error("sso_operation_not_found", 404)
+        if actor is not None and (str(actor.user_id) != str(row["actor_id"]) or str(actor.token_id) != str(row["actor_token_id"]) or actor.account_kind != "service"):
+            raise _error("sso_operation_scope_forbidden", 403)
         values = {key: row[key] for key in ("operation_id", "provider_alias", "cohort_sha256", "expires_at", "retired_at", "verbs",
-                  "target_id", "phase", "prepared_identity_ids_hash", "existing_identity_ids_hash")}
+                  "target_id", "phase", "prepared_identity_ids_hash", "existing_identity_ids_hash", "parent_operation_id", "authority_attempt")}
+        from app.sso.operation_attempts import intent_hash
+        root = row if row["parent_operation_id"] is None else await conn.fetchrow("SELECT * FROM sso_identity_operations WHERE operation_id=$1", row["parent_operation_id"])
+        values["intent_sha256"] = intent_hash(root)
+        values["owned_binding_ids"] = [str(item["identity_id"]) for item in await _binding_ids(conn, row, existing_only=True)]
+        values["owned_binding_count"] = len(values["owned_binding_ids"])
+        receipts = await conn.fetch("""SELECT r.result FROM sso_identity_operation_requests r JOIN sso_identity_operations o ON o.operation_id=r.operation_id
+            WHERE (o.operation_id=$1 OR o.parent_operation_id=$1) AND r.result->>'verb'='rollback' ORDER BY r.created_at,r.nonce""", root["operation_id"])
+        values["rollback_results"] = [_object(item["result"]) for item in receipts]
+        values.update(provider_state=None, provider_fingerprint=None, provider_readback_error=None, provider_secret_revision=None)
+        try:
+            target = await _bound_target(conn, row)
+            provider = await _provider(row["provider_alias"], target=target, allow_missing=True, allow_configuration_error=True)
+            fingerprint = provider_fingerprint(provider, alias=row["provider_alias"])
+            values.update(provider_state=provider.state if provider else "absent", provider_fingerprint=fingerprint)
+            owner = await conn.fetchrow("SELECT * FROM sso_provider_ownership WHERE target_id=$1 AND alias=$2", target.target_id, row["provider_alias"])
+            if owner and owner["owner_id"] == row["owner_id"] and owner["revision"] == row["current_provider_revision"] and owner["fingerprint"] == fingerprint and not owner["emergency_disabled"]:
+                values["provider_secret_revision"] = owner["secret_revision"]
+        except (AKBError, ProviderControlError) as exc:
+            values["provider_readback_error"] = exc.code
         values.update(provider_revision=row["current_provider_revision"], source_tuple=_object(row["source_tuple"]),
                       target_epoch=(_object(row["target_tuple"]) or {}).get("sso_session_epoch", str(row["session_epoch"]) if row["session_epoch"] else None))
         return {"schema_version": 1, **{key: (value.isoformat() if isinstance(value, datetime) else str(value)
@@ -533,10 +577,12 @@ async def retire(operation_id: uuid.UUID, *, actor_id: uuid.UUID | None = None, 
             row = await authorize_read(conn, operation_id, credential, allow_retired=True)
             actor_id = row["actor_id"]
         else:
-            row = await conn.fetchrow("SELECT operation_id FROM sso_identity_operations WHERE operation_id=$1 FOR UPDATE", operation_id)
+            row = await _lock_operation(conn, operation_id)
             if row is None:
                 raise _error("sso_operation_not_found", 404)
-        await conn.execute("UPDATE sso_identity_operations SET retired_at=COALESCE(retired_at,NOW()),phase='retired' WHERE operation_id=$1", operation_id)
+        root_id = row["parent_operation_id"] or row["operation_id"]
+        await conn.execute("""UPDATE sso_identity_operations SET retired_at=COALESCE(retired_at,NOW()),phase='retired',lineage_closed_at=COALESCE(lineage_closed_at,NOW())
+            WHERE operation_id=$1 OR parent_operation_id=$1""", root_id)
         await emit_event(conn, "auth.sso_identity_operation_retired", actor_id=str(actor_id),
                          payload={"operation_id": str(operation_id)})
     return await status(operation_id)

@@ -164,7 +164,7 @@ describe("table row management", () => {
   });
   it("F23: user filters, page and sort create history while retaining unrelated query values", async () => {
     vaultInfoMock.mockResolvedValue({ role: "reader" });
-    listRowsMock.mockResolvedValue({ columns: ["title", "severity"], items: [{ title: "An incident", severity: "high" }], total: 150 });
+    listRowsMock.mockResolvedValue({ columns: ["title", "severity"], items: Array.from({ length: 51 }, () => ({ title: "An incident", severity: "high" })), total: 51 });
     const actor = userEvent.setup(); renderTable(vi.fn(), "/vault/ops/table/incidents?external=keep");
     await actor.click(await screen.findByRole("button", { name: "Filters" }));
     const filter = screen.getByRole("dialog", { name: "Add a filter" });
@@ -186,15 +186,107 @@ describe("table row management", () => {
     expect(screen.getByTestId("table-route")).toHaveTextContent(sorted!);
     expect(screen.getByTestId("table-route")).toHaveTextContent("external=keep");
   });
-  it("F23: automatic out-of-range correction replaces its entry", async () => {
+  it("F23: a requested count corrects a confirmed empty out-of-range page by replacing its entry", async () => {
     vaultInfoMock.mockResolvedValue({ role: "reader" });
-    listRowsMock.mockResolvedValue({ columns: ["title"], items: [{ title: "One" }], total: 1 });
+    listRowsMock.mockImplementation(async (_vault, _table, options) => ({
+      columns: ["title"], items: options.countExact || options.offset ? [] : [{ title: "One" }],
+      total: options.countExact || !options.offset ? 1 : 0,
+    }));
     const actor = userEvent.setup(); renderTable(vi.fn(), "/vault/ops/table/incidents?page=99&external=keep");
+    await actor.click(await screen.findByRole("button", { name: "Count rows" }));
     await waitFor(() => expect(listRowsMock).toHaveBeenLastCalledWith("ops", "incidents", expect.objectContaining({ offset: 0 })));
     expect(screen.getByTestId("table-route")).toHaveTextContent("external=keep");
     await actor.click(screen.getByRole("button", { name: "History Back" }));
     expect(screen.getByTestId("table-route")).toHaveTextContent("/previous");
   });
+  it("does not count during discovery and counts the current view only on request", async () => {
+    const one = { id: rowId, title: "API outage" };
+    listRowsMock.mockImplementation(async (_vault, _table, options) => ({
+      kind: "table_query", columns: ["id", "title"],
+      items: options.countExact ? [] : Array.from({ length: 51 }, (_, i) => ({ ...one, id: `${rowId}-${i}` })),
+      total: options.countExact ? 121 : 51,
+    }));
+    const user = userEvent.setup();
+    renderTable();
+    await screen.findByRole("button", { name: "Count rows" });
+    expect(listTablesMock).toHaveBeenCalledWith("ops", { includeRowCounts: false });
+    expect(listRowsMock).toHaveBeenCalledWith("ops", "incidents", expect.objectContaining({ limit: 51, offset: 0, countExact: false }));
+    expect(screen.getAllByText("API outage")).toHaveLength(50);
+    await user.click(screen.getByRole("button", { name: "Count rows" }));
+    await screen.findByText("1–50 · 121 rows counted");
+    expect(listRowsMock).toHaveBeenCalledWith("ops", "incidents", expect.objectContaining({ limit: 0, countExact: true, filters: [] }));
+    await user.click(screen.getByRole("button", { name: "Next page" }));
+    await screen.findByText("51–100 · 121 rows counted");
+    expect(listRowsMock.mock.calls.filter((call) => call[2].countExact)).toHaveLength(1);
+    await user.click(screen.getByRole("button", { name: "Refresh records" }));
+    await screen.findByText("51–100 · total not counted");
+  });
+
+  it("keeps browsing after a count failure and allows explicit retry", async () => {
+    let counted = false;
+    listRowsMock.mockImplementation(async (_vault, _table, options) => {
+      if (options.countExact && !counted) { counted = true; throw new Error("count unavailable"); }
+      return { kind: "table_query", columns: ["id", "title"], items: options.countExact ? [] : [{ id: rowId, title: "API outage" }], total: 1 };
+    });
+    const user = userEvent.setup();
+    renderTable();
+    await user.click(await screen.findByRole("button", { name: "Count rows" }));
+    await screen.findByText(/Could not count rows/);
+    expect(screen.getByText("API outage")).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Count rows" }));
+    await screen.findByText("1–1 · 1 row counted");
+  });
+
+  it.each([403, 404])("clears a denied count (%i) and does not revive it on transient retry", async status => {
+    vaultInfoMock.mockResolvedValue({ role: "reader" });
+    let counts = 0;
+    listRowsMock.mockImplementation(async (_vault, _table, options) => {
+      if (options.countExact) {
+        counts += 1;
+        if (counts === 2) throw new ApiError("Denied", status, {});
+        if (counts === 3) throw new ApiError("Unavailable", 503, {});
+      }
+      return {
+        kind: "table_query", columns: ["id", "title"],
+        items: options.countExact ? [] : [{ id: rowId, title: "API outage" }],
+        total: options.countExact ? (counts === 1 ? 121 : 122) : 1,
+      };
+    });
+    const user = userEvent.setup();
+    // Access is revoked remotely while this tab stays foreground: no revision
+    // change or navigation can clear the prior successful count for us.
+    renderTable();
+    await user.click(await screen.findByRole("button", { name: "Count rows" }));
+    await screen.findByText("1–1 · 121 rows counted");
+    expect(screen.getByRole("button", { name: "Last counted page" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Recount rows" }));
+    await screen.findByText(/Could not count rows/);
+    await screen.findByText("1–1 · total not counted");
+    expect(screen.queryByRole("button", { name: "Last counted page" })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Count rows" }));
+    await waitFor(() => expect(counts).toBe(3));
+    expect(screen.getByText("1–1 · total not counted")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Last counted page" })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Count rows" }));
+    await screen.findByText("1–1 · 122 rows counted");
+    expect(screen.getByRole("button", { name: "Last counted page" })).toBeInTheDocument();
+  });
+
+  it("does not bounce to an older counted page when another writer added rows", async () => {
+    listRowsMock.mockImplementation(async (_vault, _table, options) => ({
+      kind: "table_query", columns: ["id", "title"],
+      items: options.countExact ? [] : Array.from({ length: 51 }, (_, i) => ({ id: `${rowId}-${i}`, title: `Row ${i}` })),
+      total: options.countExact ? 50 : 51,
+    }));
+    const user = userEvent.setup();
+    renderTable();
+    await user.click(await screen.findByRole("button", { name: "Count rows" }));
+    await screen.findByText("1–50 · 50 rows counted");
+    await user.click(screen.getByRole("button", { name: "Next page" }));
+    await screen.findByText("51–100 · 50 rows counted");
+    expect(listRowsMock).toHaveBeenLastCalledWith("ops", "incidents", expect.objectContaining({ offset: 50, countExact: false }));
+  });
+
   it.each(["checking", "failed", "catalog failure"])("blocks an open publication draft during %s access verification", async (state) => {
     vaultInfoMock.mockResolvedValue({ role: "writer", is_archived: false, is_external_git: false });
     vi.mocked(previewTablePublicationQuery).mockResolvedValue({ kind: "table_query", columns: ["title"], items: [{ title: "API outage" }], total: 1 });
@@ -396,13 +488,13 @@ describe("table row management", () => {
     listRowsMock.mockResolvedValue({
       kind: "table_query",
       columns: ["id", "title", "severity", "created_at", "updated_at"],
-      items: [{
-        id: rowId,
-        title: "API outage",
+      items: Array.from({ length: 51 }, (_, index) => ({
+        id: `${rowId}-${index}`,
+        title: `API outage ${index}`,
         severity: "high",
         created_at: "2026-08-31T04:45:00Z",
         updated_at: "2026-09-01T04:45:00Z",
-      }],
+      })),
       total: 121,
     });
     const user = userEvent.setup();
@@ -434,7 +526,7 @@ describe("table row management", () => {
     await waitFor(() => expect(listRowsMock).toHaveBeenLastCalledWith(
       "ops",
       "incidents",
-      expect.objectContaining({ offset: 50, limit: 50 }),
+      expect.objectContaining({ offset: 50, limit: 51, countExact: false }),
     ));
   });
 

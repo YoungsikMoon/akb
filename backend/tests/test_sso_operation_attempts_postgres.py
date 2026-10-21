@@ -209,3 +209,33 @@ async def test_child_rollback_never_deletes_external_recreated_binding(lane):  #
     assert refused.value.code == "sso_operation_binding_not_owned"
     assert await pool.fetchval("SELECT EXISTS(SELECT 1 FROM external_identities WHERE id=$1)", replacement)
     assert (await ops.status(uuid.UUID(child["operation_id"])))["owned_binding_count"] == 0
+
+
+async def test_mixed_cohort_status_selects_only_owned_indices_for_compensation(lane):  # noqa: F811
+    pool = lane["pool"]
+    existing_id = await pool.fetchval("""INSERT INTO external_identities(user_id,issuer,subject)
+        VALUES($1,'https://auth.akb.example.com/realms/akb','broker-subject') RETURNING id""", lane["target"])
+    added_user = uuid.uuid4()
+    await pool.execute("""INSERT INTO users(id,username,email,password_hash,account_kind,auth_provider)
+        VALUES($1,'mixed-added','mixed-added@example.test','!fixture!','human','keycloak')""", added_user)
+    await pool.execute("""INSERT INTO external_identities(user_id,issuer,subject)
+        VALUES($1,'https://accounts.example.com/realms/workforce','upstream-added')""", added_user)
+    lane["spec"]["cohort"].append({"existing_user_id": str(added_user),
+                                  "upstream_subject": "upstream-added", "broker_subject": "broker-added"})
+    parent_id = lane["spec"]["operation_id"]
+    grant = await ops.grant(lane["spec"], granted_by=lane["human"])
+    preserved = await ops.execute(parent_id, grant["credential"], request("apply", item_index=0))
+    assert preserved["binding_changed"] is False
+    await ops.execute(parent_id, grant["credential"], request("apply", item_index=1))
+    child = await fresh(parent_id, pool, lane["human"])
+    child_id = uuid.UUID(child["operation_id"])
+    status = await ops.status(child_id, credential=child["credential"])
+    assert status["owned_binding_count"] == 1
+    assert status["owned_binding_item_indices"] == [1]
+    for index in status["owned_binding_item_indices"]:
+        result = await ops.execute(child_id, child["credential"], request("rollback", item_index=index))
+        assert result["binding_changed"] is True
+    status = await ops.status(child_id, credential=child["credential"])
+    assert status["owned_binding_count"] == 0 and status["owned_binding_item_indices"] == []
+    assert await pool.fetchval("SELECT user_id FROM external_identities WHERE id=$1", existing_id) == lane["target"]
+    assert await pool.fetchval("SELECT COUNT(*) FROM external_identities WHERE user_id=$1", added_user) == 1

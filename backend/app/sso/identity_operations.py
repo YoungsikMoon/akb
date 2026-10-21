@@ -550,6 +550,13 @@ async def status(operation_id: uuid.UUID, *, credential: str | None = None, acto
         values["intent_sha256"] = intent_hash(root)
         values["owned_binding_ids"] = [str(item["identity_id"]) for item in await _binding_ids(conn, row, existing_only=True)]
         values["owned_binding_count"] = len(values["owned_binding_ids"])
+        # Compensation selects exact operation-owned rows across human
+        # reauthorization attempts. Pre-existing target bindings are preserved.
+        values["owned_binding_item_indices"] = [item["item_index"] for item in await conn.fetch("""SELECT DISTINCT b.item_index
+            FROM sso_identity_operation_bindings b
+            JOIN sso_identity_operations o ON o.operation_id=b.operation_id
+            JOIN external_identities e ON e.id=b.identity_id
+            WHERE o.operation_id=$1 OR o.parent_operation_id=$1 ORDER BY b.item_index""", root["operation_id"])]
         receipts = await conn.fetch("""SELECT r.result FROM sso_identity_operation_requests r JOIN sso_identity_operations o ON o.operation_id=r.operation_id
             WHERE (o.operation_id=$1 OR o.parent_operation_id=$1) AND r.result->>'verb'='rollback' ORDER BY r.created_at,r.nonce""", root["operation_id"])
         values["rollback_results"] = [_object(item["result"]) for item in receipts]

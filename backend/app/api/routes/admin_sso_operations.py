@@ -167,6 +167,7 @@ class StatusResponse(RequestModel):
     authority_attempt: int
     owned_binding_ids: list[uuid.UUID]
     owned_binding_count: int
+    owned_binding_item_indices: list[int]
     rollback_results: list[IdentityResultResponse]
     provider_state: str | None
     provider_fingerprint: str | None

@@ -526,10 +526,15 @@ async def _postcheck(conn, row, target):
         if result.state == "linked":
             linked.append(item["existing_user_id"])
     prepared = bool(cohort) and len(linked) == len(cohort)
-    await conn.execute("""UPDATE sso_identity_operations SET phase=$2,existing_identity_ids_hash=$3,
-        prepared_identity_ids_hash=$4 WHERE operation_id=$1""", row["operation_id"],
+    # Reauthorization clones the immutable root's latest mutable readback.
+    # Keep that lineage checkpoint current across expired child attempts while
+    # retaining retired phases and every original intent/credential boundary.
+    await conn.execute("""UPDATE sso_identity_operations SET
+        phase=CASE WHEN retired_at IS NOT NULL THEN 'retired' ELSE $2 END,
+        existing_identity_ids_hash=$3,prepared_identity_ids_hash=$4
+        WHERE operation_id=$1 OR operation_id=$5""", row["operation_id"],
         "prepared" if prepared else "preparing", _digest(sorted(identities)) if cohort else None,
-        _digest(sorted(linked)) if prepared else None)
+        _digest(sorted(linked)) if prepared else None, row["parent_operation_id"])
 
 
 async def status(operation_id: uuid.UUID, *, credential: str | None = None, actor=None) -> dict[str, Any]:

@@ -239,3 +239,56 @@ async def test_mixed_cohort_status_selects_only_owned_indices_for_compensation(l
     assert status["owned_binding_count"] == 0 and status["owned_binding_item_indices"] == []
     assert await pool.fetchval("SELECT user_id FROM external_identities WHERE id=$1", existing_id) == lane["target"]
     assert await pool.fetchval("SELECT COUNT(*) FROM external_identities WHERE user_id=$1", added_user) == 1
+
+
+async def test_latest_whole_cohort_hashes_survive_multiple_expired_attempts(preparation):  # noqa: F811
+    pool = preparation["pool"]
+    original_cohort = preparation["spec"]["cohort"]
+    root = await target_grant(preparation, verbs=["apply", "rollback", "enable", "disable"], cohort=original_cohort)
+    root_id = preparation["spec"]["operation_id"]
+    original = await pool.fetchrow("SELECT * FROM sso_identity_operations WHERE operation_id=$1", root_id)
+    original_intent = attempts.intent_hash(original)
+    assert original["prepared_identity_ids_hash"] is None
+    # The root expires before preparation; only the second attempt applies it.
+    await expire(pool, root_id)
+    second = await fresh(root_id, pool, preparation["human"])
+    second_id = uuid.UUID(second["operation_id"])
+    applied = await ops.execute(second_id, second["credential"], request("apply"))
+    assert applied["binding_changed"] and applied["state"] == "linked"
+    prepared = await ops.status(second_id)
+    hashes = {key: prepared[key] for key in ("existing_identity_ids_hash", "prepared_identity_ids_hash")}
+    assert all(hashes.values())
+    # A second expiry must inherit the last actual whole-cohort postcheck,
+    # rather than the root's never-prepared initial values.
+    await expire(pool, second_id)
+    third = await fresh(root_id, pool, preparation["human"])
+    third_id = uuid.UUID(third["operation_id"])
+    status = await ops.status(third_id)
+    assert {key: status[key] for key in hashes} == hashes
+    assert status["phase"] == "prepared" and third["authority_attempt"] == 3
+    enabled = await ops.execute(third_id, third["credential"], request("enable", payload={}))
+    assert enabled["provider"]["enabled"] is True
+    # The immutable root is a retired journal authority, never reactivated by
+    # postchecks/revisions. Old credentials and original intent stay fenced.
+    for operation_id, grant in ((root_id, root), (second_id, second)):
+        with pytest.raises(AKBError) as retired:
+            await ops.execute(operation_id, grant["credential"], request("apply"))
+        assert retired.value.code == "sso_operation_retired"
+    after = await pool.fetchrow("SELECT * FROM sso_identity_operations WHERE operation_id=$1", root_id)
+    assert after["phase"] == "retired" and after["retired_at"] is not None
+    assert attempts.intent_hash(after) == original_intent == third["intent_sha256"]
+    assert all(after[field] == original[field] for field in attempts.INTENT_FIELDS)
+    # A later real rollback clears the lineage's prepared attestation, so a
+    # fourth attempt cannot borrow the earlier prepared cohort hash.
+    await ops.execute(third_id, third["credential"], request("disable", payload={}))
+    await ops.execute(third_id, third["credential"], request("rollback"))
+    await expire(pool, third_id)
+    fourth = await fresh(root_id, pool, preparation["human"])
+    fourth_status = await ops.status(uuid.UUID(fourth["operation_id"]))
+    assert fourth["authority_attempt"] == 4 and fourth["intent_sha256"] == original_intent
+    assert fourth_status["existing_identity_ids_hash"] == hashes["existing_identity_ids_hash"]
+    assert fourth_status["prepared_identity_ids_hash"] is None
+    assert fourth_status["phase"] == "granted"
+    assert (await ops.status(root_id))["phase"] == "retired"
+    assert await pool.fetchval("SELECT user_id FROM tokens WHERE id=$1", preparation["target_tid"]) == preparation["target"]
+    assert await pool.fetchval("SELECT role FROM vault_access WHERE vault_id=$1 AND user_id=$2", preparation["vid"], preparation["target"]) == "writer"

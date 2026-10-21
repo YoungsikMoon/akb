@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { screen, within, cleanup, waitFor, fireEvent } from "@testing-library/react";
+import { screen, within, cleanup, waitFor, fireEvent, act } from "@testing-library/react";
 import { render } from "@/test-query-client";
 import userEvent from "@testing-library/user-event";
 import { Link, MemoryRouter, useLocation } from "react-router-dom";
@@ -67,10 +67,10 @@ const sample = {
   ],
 };
 
-function renderAt(pathname: string) {
+function renderAt(pathname: string, presentation: "standalone" | "focused" = "standalone") {
   return render(
     <MemoryRouter initialEntries={[pathname]}>
-      <VaultExplorer vault="v" />
+      <VaultExplorer vault="v" presentation={presentation} />
     </MemoryRouter>,
   );
 }
@@ -83,7 +83,10 @@ function PublishCurrent({ value, onlyOnResource = false }: { value: ResourceLoca
 
 beforeEach(() => {
   browseMock.mockReset();
-  browseMock.mockResolvedValue(sample);
+  browseMock.mockImplementation(async (_vault: string, _collection: string, _depth: number, options: { name_query?: string } = {}) => ({
+    ...sample, name_query: options.name_query,
+    items: options.name_query ? sample.items.filter(item => `${item.name} ${item.path}`.toLocaleLowerCase().includes(options.name_query!.toLocaleLowerCase())) : sample.items,
+  }));
   vaultInfoMock.mockReset();
   // Default to reader so the existing tests don't accidentally render
   // the mutation affordances. Tests that need writer+ override this.
@@ -99,6 +102,263 @@ beforeEach(() => {
 });
 
 afterEach(() => cleanup());
+
+describe("focused content navigation", () => {
+  it("keeps sibling Collections visible when a document is opened without requiring a filter reset", async () => {
+    const user = userEvent.setup();
+    render(<MemoryRouter initialEntries={["/vault/v"]}><ResourceLocationProvider identity="reader">
+      <PublishCurrent onlyOnResource value={{ vault: "v", title: "Start", kind: "Document", collectionPath: "guides", resourceRef: "guides/start.md", status: "active" }} />
+      <VaultExplorer vault="v" presentation="focused" />
+    </ResourceLocationProvider></MemoryRouter>);
+    await user.click(await screen.findByRole("button", { name: "architecture" }));
+    await user.click(screen.getByRole("button", { name: "guides" }));
+    await user.click(screen.getByRole("link", { name: /^Document:\s*Start$/ }));
+    await waitFor(() => expect(screen.getByRole("link", { name: /^Document:\s*Start$/ })).toHaveAttribute("aria-current", "page"));
+    expect(screen.getByRole("button", { name: "architecture" })).toBeVisible();
+    expect(screen.getByRole("link", { name: /^Document:\s*Schema$/ })).toBeVisible();
+    expect(screen.getByRole("link", { name: /^Document:\s*System$/ })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Filter content" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Reset filters" })).not.toBeInTheDocument();
+  });
+
+  it("keeps identity in the parent and exposes native collection disclosures and document links", async () => {
+    const user = userEvent.setup();
+    const { container } = renderAt("/vault/v", "focused");
+    const collection = await screen.findByRole("button", { name: "guides" });
+    expect(container.querySelector('[data-slot="collection-identity-header"]')).toBeNull();
+    expect(container.querySelector('[data-slot="collection-management-row"]')).toHaveTextContent("Collections");
+    expect(screen.queryByText("Content", { exact: true })).not.toBeInTheDocument();
+    expect(screen.getByRole("searchbox", { name: "Filter resources" })).toBeVisible();
+    expect(screen.queryByRole("tree")).not.toBeInTheDocument();
+    expect(screen.queryByRole("treeitem")).not.toBeInTheDocument();
+    expect(collection).toHaveAttribute("aria-expanded", "false");
+    await user.click(collection);
+    expect(collection).toHaveAttribute("aria-expanded", "true");
+    const link = within(screen.getByRole("navigation", { name: "v explorer" })).getByRole("link", { name: /Document:\s*Start/ });
+    expect(link).toHaveAttribute("href", "/vault/v/doc/guides%2Fstart.md");
+    expect(link).not.toHaveAttribute("aria-selected");
+    expect(screen.queryByRole("button", { name: "Add content" })).not.toBeInTheDocument();
+  });
+
+  it("keeps search available while advanced filters are closed and restores it after Reset", async () => {
+    const user = userEvent.setup();
+    renderAt("/vault/v", "focused");
+    await screen.findByRole("button", { name: "architecture" });
+    await user.click(screen.getByRole("button", { name: "Filter content" }));
+    const query = screen.getByRole("searchbox", { name: "Filter resources" });
+    await waitFor(() => expect(query).toHaveFocus());
+    await user.type(query, "Schema");
+    await user.click(screen.getByRole("button", { name: "Filter content, 1 active" }));
+    expect(query).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Collection search scope" })).not.toBeInTheDocument();
+    expect(screen.getByText("Name: Schema")).toBeVisible();
+    expect(screen.getByRole("link", { name: /Document:\s*Schema/ })).toBeVisible();
+    await waitFor(() => expect(screen.queryByRole("button", { name: "guides" })).not.toBeInTheDocument());
+    await user.click(screen.getByRole("button", { name: "Reset filters" }));
+    expect(query).toHaveFocus();
+    expect(await screen.findByRole("button", { name: "guides" })).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Filter content" }));
+    expect(screen.getByRole("searchbox", { name: "Filter resources" })).toHaveValue("");
+  });
+
+  it("reveals the name field when a collection action narrows the scope", async () => {
+    const user = userEvent.setup();
+    renderAt("/vault/v", "focused");
+    await user.click(await screen.findByRole("button", { name: "Collection actions for architecture" }));
+    await user.click(screen.getByRole("menuitem", { name: "Search in collection" }));
+    await waitFor(() => expect(screen.getByRole("searchbox", { name: "Filter resources" })).toHaveFocus());
+    await user.click(screen.getByRole("button", { name: "Filter content, 1 active" }));
+    expect(screen.getByText("Collection: architecture")).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Reset filters" }));
+    expect(screen.getByRole("button", { name: "guides" })).toBeVisible();
+  });
+
+  it("clears only the standalone search query and keeps Collection scope", async () => {
+    const user = userEvent.setup();
+    renderAt("/vault/v", "focused");
+    await user.click(await screen.findByRole("button", { name: "Collection actions for architecture" }));
+    await user.click(screen.getByRole("menuitem", { name: "Search in collection" }));
+    const search = screen.getByRole("searchbox", { name: "Filter resources" });
+    await user.type(search, "Schema");
+    expect(screen.getByRole("button", { name: "Filter content, 2 active" })).toBeVisible();
+    await user.tab();
+    expect(screen.getByRole("button", { name: "Clear filter resources" })).toHaveFocus();
+    await user.keyboard("{Enter}");
+    expect(search).toHaveValue("");
+    expect(search).toHaveFocus();
+    expect(screen.getByRole("button", { name: "Filter content, 1 active" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Collection search scope" })).toHaveTextContent("architecture");
+    await waitFor(() => expect(screen.queryByRole("button", { name: "guides" })).not.toBeInTheDocument());
+  });
+
+  it("updates the focused list after a document state change without manual refresh", async () => {
+    renderAt("/vault/v", "focused");
+    await screen.findByRole("button", { name: "guides" });
+    browseMock.mockResolvedValue({ ...sample, items: [...sample.items, { type: "collection", name: "reference", path: "reference" }] });
+    fireEvent(window, new CustomEvent("akb:document-status-changed", { detail: { vault: "v" } }));
+    expect(await screen.findByRole("button", { name: "reference" })).toBeVisible();
+    expect(browseMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("offers one creation menu only after write authority is verified", async () => {
+    vaultInfoMock.mockResolvedValue({ role: "writer" });
+    const user = userEvent.setup();
+    renderAt("/vault/v", "focused");
+    const create = await screen.findByRole("button", { name: "Add content" });
+    expect(create).toHaveTextContent("");
+    expect(screen.queryByText("New content", { exact: true })).not.toBeInTheDocument();
+    await user.click(create);
+    for (const name of ["New document", "Upload file", "New table", "New collection"]) {
+      expect(screen.getByRole("menuitem", { name })).toBeVisible();
+    }
+  });
+
+  it("returns from an add dialog to the persistent plus button", async () => {
+    vaultInfoMock.mockResolvedValue({ role: "writer" });
+    renderAt("/vault/v", "focused");
+    const user = userEvent.setup();
+    const add = await screen.findByRole("button", { name: "Add content" });
+    await user.click(add);
+    await user.click(screen.getByRole("menuitem", { name: "Upload file" }));
+    const dialog = screen.getByRole("dialog", { name: "Upload a file" });
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(add).toHaveFocus());
+  });
+
+  it("keeps refresh available after an initial read failure without opening filters", async () => {
+    browseMock.mockRejectedValueOnce(new Error("Content unavailable"));
+    const user = userEvent.setup();
+    renderAt("/vault/v", "focused");
+    expect(await screen.findByRole("alert")).toHaveTextContent("Content unavailable");
+    expect(screen.getByRole("searchbox", { name: "Filter resources" })).toBeVisible();
+    const refresh = screen.getByRole("button", { name: "Refresh content" });
+    expect(refresh).toHaveTextContent("Refresh content");
+    expect(refresh.closest('[data-slot="sidebar-search-toolbar"]')).toBeNull();
+    await user.click(refresh);
+    expect(await screen.findByRole("button", { name: "guides" })).toBeVisible();
+    expect(screen.getByRole("navigation", { name: "v explorer" })).not.toHaveAttribute("aria-busy");
+  });
+
+  it("moves between a disclosure and its child without trapping ordinary Tab navigation", async () => {
+    const user = userEvent.setup();
+    renderAt("/vault/v", "focused");
+    const collection = await screen.findByRole("button", { name: "guides" });
+    collection.focus();
+    await user.keyboard("{ArrowRight}{ArrowRight}");
+    const child = screen.getByRole("link", { name: /Document:\s*Start/ });
+    expect(child).toHaveFocus();
+    await user.keyboard("{ArrowLeft}");
+    expect(collection).toHaveFocus();
+    await user.keyboard("{ArrowLeft}");
+    expect(collection).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByRole("link", { name: /Document:\s*Start/ })).not.toBeInTheDocument();
+  });
+});
+
+describe("collection exploration", () => {
+  const nested = { ...sample, items: [...sample.items,
+    { type: "collection", name: "Design decisions", path: "architecture/design" },
+    { type: "collection", name: "Older designs", path: "architecture/design-old" },
+    { type: "document", name: "Shared decision", path: "architecture/design/decision.md" },
+    { type: "document", name: "Shared old decision", path: "architecture/design-old/decision.md" },
+  ] };
+
+  async function explore(user: ReturnType<typeof userEvent.setup>, path: string) {
+    await user.click(await screen.findByRole("button", { name: `Collection actions for ${path}` }));
+    await user.click(screen.getByRole("menuitem", { name: "Explore from here" }));
+  }
+
+  it("narrows only the rail, preserves filters, and returns to its actual parent", async () => {
+    browseMock.mockImplementation(async (_vault: string, _collection: string, _depth: number, options: { name_query?: string } = {}) => ({
+      ...nested,
+      name_query: options.name_query,
+      items: options.name_query
+        ? nested.items.filter(item => `${item.name} ${item.path}`.toLocaleLowerCase().includes(options.name_query!.toLocaleLowerCase()))
+        : nested.items,
+    }));
+    const user = userEvent.setup();
+    const { container } = renderAt("/vault/v/doc/architecture%2Fdesign%2Fdecision.md", "focused");
+    await screen.findByRole("button", { name: "design" });
+    await user.type(screen.getByRole("searchbox", { name: "Filter resources" }), "Shared");
+    await waitFor(() => expect(browseMock).toHaveBeenCalledWith("v", undefined, -1, expect.objectContaining({ name_query: "Shared" })));
+    const reads = browseMock.mock.calls.length;
+    await explore(user, "architecture/design");
+    const context = screen.getByRole("navigation", { name: "Collection exploration" });
+    expect(within(context).getByRole("button", { name: "Collection exploration path" })).toHaveTextContent("design");
+    expect(within(context).getByRole("button", { name: "Back to collection architecture" })).toHaveFocus();
+    expect(container.querySelector('[data-sig="collection:architecture/design"]')).toBeNull();
+    expect(await screen.findByRole("link", { name: /Document:\s*Shared decision/ })).toHaveAttribute("aria-current", "page");
+    expect(screen.queryByRole("link", { name: /Document:\s*Shared old decision/ })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Reset filters" }));
+    expect(context).toBeVisible();
+    expect(screen.getByRole("searchbox", { name: "Filter resources" })).toHaveValue("");
+    await user.click(within(context).getByRole("button", { name: "Back to collection architecture" }));
+    expect(within(context).getByRole("button", { name: "Back to all collections" })).toHaveFocus();
+    await screen.findByRole("button", { name: "design" });
+    expect(screen.getByRole("button", { name: "design-old" })).toBeVisible();
+    await user.click(within(context).getByRole("button", { name: "Collection exploration path" }));
+    await user.click(screen.getByRole("menuitem", { name: "All collections" }));
+    expect(screen.queryByRole("navigation", { name: "Collection exploration" })).not.toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "guides" })).toBeVisible();
+    expect(browseMock.mock.calls.length).toBeGreaterThan(reads);
+    expect(browseMock.mock.calls.every(call => call[3]?.page_size === 100 && !call[3]?.cursor)).toBe(true);
+  });
+
+  it("does not reset explicit exploration because a different document is already open", async () => {
+    const user = userEvent.setup();
+    browseMock.mockResolvedValue({ ...sample, items: [...sample.items, { type: "document", name: "Other guide", path: "guides/other.md" }] });
+    render(<MemoryRouter initialEntries={["/vault/v/doc/guides%2Fstart.md"]}>
+      <Link to="/vault/v/doc/guides%2Fstart.md?view=raw">Change reading mode</Link>
+      <Link to="/vault/v/doc/guides%2Fother.md">Open another destination</Link>
+      <VaultExplorer vault="v" presentation="focused" />
+    </MemoryRouter>);
+    await explore(user, "architecture");
+    expect(screen.getByRole("navigation", { name: "Collection exploration" })).toBeVisible();
+    await waitFor(() => expect(screen.queryByRole("button", { name: "guides" })).not.toBeInTheDocument());
+    await user.click(screen.getByRole("link", { name: "Change reading mode" }));
+    expect(screen.getByRole("navigation", { name: "Collection exploration" })).toBeVisible();
+    await user.click(screen.getByRole("link", { name: "Open another destination" }));
+    await waitFor(() => expect(screen.queryByRole("navigation", { name: "Collection exploration" })).not.toBeInTheDocument());
+    expect(screen.getByRole("link", { name: /Document:\s*Other guide/ })).toHaveAttribute("aria-current", "page");
+  });
+
+  it("resets exploration when the account or Vault changes", async () => {
+    const user = userEvent.setup();
+    const explorer = (vault: string, id: string) => <MemoryRouter><CurrentUserProvider user={{ user_id: id, username: id, display_name: id, email: `${id}@example.test`, is_admin: false, auth_method: "local", key_class: null }}><VaultExplorer vault={vault} presentation="focused" /></CurrentUserProvider></MemoryRouter>;
+    const { rerender } = render(explorer("v", "alice"));
+    await explore(user, "architecture");
+    rerender(explorer("v", "bob"));
+    expect(screen.queryByRole("navigation", { name: "Collection exploration" })).not.toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "guides" })).toBeVisible();
+    await explore(user, "architecture");
+    rerender(explorer("other", "bob"));
+    expect(screen.queryByRole("navigation", { name: "Collection exploration" })).not.toBeInTheDocument();
+  });
+
+  it("resolves an outside destination that arrives after its browse refresh", async () => {
+    const user = userEvent.setup();
+    render(<MemoryRouter initialEntries={["/vault/v/doc/architecture%2Fschema.md"]}>
+      <Link to="/vault/v/doc/guides%2Fnew.md">Open new resource</Link>
+      <VaultExplorer vault="v" presentation="focused" />
+    </MemoryRouter>);
+    await explore(user, "architecture");
+    let finish!: (value: typeof sample) => void;
+    await screen.findByRole("link", { name: /Document:\s*Schema/ });
+    let pending = true;
+    browseMock.mockImplementation((_vault: string, _collection: string, depth: number) => {
+      if (depth === -1 && pending) { pending = false; return new Promise<typeof sample>(resolve => { finish = resolve; }); }
+      return Promise.resolve(sample);
+    });
+    await user.click(screen.getByRole("button", { name: "Refresh content" }));
+    await user.click(screen.getByRole("link", { name: "Open new resource" }));
+    expect(screen.getByRole("navigation", { name: "Collection exploration" })).toBeVisible();
+    const updated = { ...sample, items: [...sample.items, { type: "document", name: "New resource", path: "guides/new.md" }] };
+    browseMock.mockResolvedValue(updated);
+    await act(async () => finish(updated));
+    await waitFor(() => expect(screen.queryByRole("navigation", { name: "Collection exploration" })).not.toBeInTheDocument());
+    expect(await screen.findByRole("link", { name: /Document:\s*New resource/ })).toHaveAttribute("aria-current", "page");
+  });
+});
 
 describe("collection shortcut navigation", () => {
   it("keeps the scope selector inside the filters disclosure instead of the initial rail", async () => {
@@ -225,10 +485,10 @@ describe("collection shortcut navigation", () => {
     const query = screen.getByRole("searchbox", { name: "Filter resources" });
     await waitFor(() => expect(query).toHaveFocus());
     expect(screen.getByRole("button", { name: "Collection search scope" })).toHaveTextContent("architecture");
-    expect(screen.queryByRole("button", { name: "guides" })).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByRole("button", { name: "guides" })).not.toBeInTheDocument());
     await user.type(query, "diagram");
     expect(screen.getByRole("treeitem", { name: /File:\s*diagram.png/ })).toBeInTheDocument();
-    expect(screen.queryByRole("treeitem", { name: /Document:\s*Schema/ })).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByRole("treeitem", { name: /Document:\s*Schema/ })).not.toBeInTheDocument());
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
@@ -312,7 +572,7 @@ describe("VaultExplorer — rendering", () => {
     ["Document", "guides/last.md", "/vault/v/doc/guides%2Flast.md"],
     ["File", "file-last", "/vault/v/file/file-last"],
     ["Table", "table_last", "/vault/v/table/table_last"],
-  ] as const)("reveals an authorized current %s beyond the first page without full traversal", async (kind, ref, route) => {
+  ] as const)("reveals an authorized current %s without narrowing the Collection list or traversing every page", async (kind, ref, route) => {
     browseMock.mockResolvedValue({ ...sample, complete: false, next_cursor: "next", items: [sample.items[0]] });
     // A table's authorized name is also its routing identity; unlike a
     // Document title or File display name, it is not an arbitrary alias.
@@ -324,8 +584,11 @@ describe("VaultExplorer — rendering", () => {
     const row = await screen.findByRole("treeitem", { name: new RegExp(`^${kind}:\\s*${title}$`) });
     expect(row).toBeVisible();
     expect(row).toHaveAttribute("aria-current", "page");
+    expect(screen.getByRole("button", { name: "architecture" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Reset filters" })).not.toBeInTheDocument();
     expect(browseMock.mock.calls.every(call => !call[3]?.cursor)).toBe(true);
-    expect(browseMock).toHaveBeenCalledWith("v", "guides", -1, expect.objectContaining({ page_size: 100, content_type: "all" }));
+    expect(browseMock.mock.calls.every(call => !call[1])).toBe(true);
+    expect(browseMock).toHaveBeenCalledWith("v", undefined, -1, expect.objectContaining({ page_size: 100, content_type: "all" }));
   });
 
   it("resets the old kind scope on resource navigation but preserves a later manual collapse", async () => {
@@ -357,7 +620,7 @@ describe("VaultExplorer — rendering", () => {
     await user.click(screen.getByRole("menuitemradio", { name: /^Documents/ }));
     await user.click(screen.getByRole("button", { name: "Resource type" }));
     const tables = screen.getByRole("menuitemradio", { name: /^Tables/ });
-    expect(tables).toHaveTextContent("Not loaded in this view");
+    expect(tables).toHaveTextContent("Browse tables");
     expect(tables).not.toHaveTextContent("0 tables");
   });
 
@@ -530,7 +793,7 @@ describe("VaultExplorer — interaction", () => {
     const filter = screen.getByLabelText(/filter resources/i);
     await user.type(filter, "schema");
     expect(screen.getByRole("treeitem", { name: /Schema/ })).toBeInTheDocument();
-    expect(screen.queryByRole("treeitem", { name: /Start/ })).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByRole("treeitem", { name: /Start/ })).not.toBeInTheDocument());
   });
 
   it("filters by resource kind without making users traverse unrelated rows", async () => {
@@ -550,6 +813,7 @@ describe("VaultExplorer — interaction", () => {
     const user = userEvent.setup();
     browseMock.mockResolvedValueOnce({
       vault: "v",
+      complete: true, next_cursor: null,
       path: "",
       items: [
         { type: "collection", name: "large", path: "large" },
@@ -575,10 +839,9 @@ describe("VaultExplorer — interaction", () => {
     expect(screen.getByRole("treeitem", { name: "Files, 1 item" })).toBeInTheDocument();
     expect(screen.getByRole("treeitem", { name: /owners/i })).toBeInTheDocument();
     expect(screen.getByRole("treeitem", { name: /diagram.png/i })).toBeInTheDocument();
-    expect(screen.queryByRole("treeitem", { name: /Doc 0021/i })).not.toBeInTheDocument();
-    await user.click(screen.getByRole("treeitem", { name: /Show 50 more documents/i }));
+    expect(screen.getByRole("treeitem", { name: /Doc 0021/i })).toBeInTheDocument();
     expect(screen.getByRole("treeitem", { name: /Doc 0070/i })).toBeInTheDocument();
-    expect(screen.queryByRole("treeitem", { name: /Doc 0071/i })).not.toBeInTheDocument();
+    expect(screen.getByRole("treeitem", { name: /Doc 0075/i })).toBeInTheDocument();
   });
 
   it("ArrowDown moves focus through the visible list", async () => {
@@ -625,7 +888,7 @@ describe("VaultExplorer — role gating", () => {
     const user = userEvent.setup();
     vaultInfoMock.mockResolvedValue({ role: "writer" });
     renderAt("/vault/v");
-    await user.click(await screen.findByRole("button", { name: /create in vault/i }));
+    await user.click(await screen.findByRole("button", { name: /add content/i }));
     expect(screen.getByRole("menuitem", { name: /new document/i })).toBeInTheDocument();
     expect(screen.getByRole("menuitem", { name: /upload file/i })).toBeInTheDocument();
     expect(screen.getByRole("menuitem", { name: /new table/i })).toBeInTheDocument();
@@ -637,7 +900,7 @@ describe("VaultExplorer — role gating", () => {
     renderAt("/vault/v");
     await screen.findByRole("button", { name: /^architecture/i });
     expect(
-      screen.queryByRole("button", { name: /create in vault/i }),
+      screen.queryByRole("button", { name: /add content/i }),
     ).not.toBeInTheDocument();
   });
 

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
 import { useAccessVerification, useCurrentUser } from "@/contexts/current-user-context";
-import { browseVault, type ArchiveScope, type BrowseOptions } from "@/lib/api";
+import { ApiError, browseVault, type ArchiveScope, type BrowseOptions } from "@/lib/api";
 import { isReservedCollection } from "@/lib/skill";
 import { parseFileUri } from "@/lib/uri";
 
@@ -32,8 +32,8 @@ interface BrowseItem {
   [k: string]: any;
 }
 
-/** Account/grant-scoped pages. Loading another page is an explicit action,
- * never a background full-Vault download disguised as pagination. */
+/** Account/grant-scoped pages. Scroll demand and scoped searches request one
+ * bounded page at a time rather than downloading a whole Vault up front. */
 export function vaultTreeQueryKey(
   userId: string | undefined,
   revision: number,
@@ -46,18 +46,32 @@ export function vaultTreeQueryKey(
 export function useVaultTree(
   vault: string | undefined,
   archiveScope: ArchiveScope = "unarchived",
-  options: { content_type?: BrowseOptions["content_type"]; collection?: string; enabled?: boolean } = {},
+  options: { content_type?: BrowseOptions["content_type"]; collection?: string; depth?: number; name_query?: string; enabled?: boolean } = {},
 ) {
   const user = useCurrentUser();
   const { checking, revision } = useAccessVerification();
   const query = useInfiniteQuery({
-    queryKey: [...vaultTreeQueryKey(user?.user_id, revision, vault ?? "", archiveScope), options.content_type ?? "all", options.collection ?? ""],
+    queryKey: [...vaultTreeQueryKey(user?.user_id, revision, vault ?? "", archiveScope), options.content_type ?? "all", options.collection ?? "", ...(options.depth === undefined ? [] : [options.depth]), ...(options.name_query ? [options.name_query] : [])],
     initialPageParam: undefined as string | undefined,
-    queryFn: ({ pageParam }) => browseVault(vault!, options.collection, -1, {
-      page_size: 100, archive_scope: archiveScope,
-      ...(options.content_type ? { content_type: options.content_type } : {}),
-      ...(pageParam ? { cursor: pageParam } : {}),
-    }),
+    queryFn: async (context) => {
+      const { pageParam, client, queryKey } = context;
+      try {
+        const result = await browseVault(vault!, options.collection, options.depth ?? -1, {
+          page_size: 100, archive_scope: archiveScope,
+          ...(options.content_type ? { content_type: options.content_type } : {}),
+          ...(pageParam ? { cursor: pageParam } : {}),
+          ...(options.name_query ? { name_query: options.name_query } : {}),
+          signal: context.signal,
+        });
+        if (options.name_query && result.name_query !== options.name_query) throw new Error("Name search is unavailable. Please try again later.");
+        return result;
+      } catch (error) {
+        if (!context.signal.aborted && error instanceof ApiError && [401, 403].includes(error.status)) {
+          client.getQueryCache().find({ queryKey, exact: true })?.setState({ data: undefined, dataUpdatedAt: 0 });
+        }
+        throw error;
+      }
+    },
     getNextPageParam: (lastPage) => lastPage.next_cursor ?? undefined,
     staleTime: 30_000,
     retry: false,
@@ -76,14 +90,16 @@ export function useVaultTree(
   }, [queryClient, userId, revision, vault]);
 
   useEffect(() => {
+    if (options.enabled === false) return;
     const refresh = (event: Event) => {
       if ((event as CustomEvent<{ vault?: string }>).detail?.vault === vault) refetch();
     };
     window.addEventListener("akb:document-status-changed", refresh);
     return () => window.removeEventListener("akb:document-status-changed", refresh);
-  }, [vault, refetch]);
+  }, [vault, refetch, options.enabled]);
 
-  const data = vault && !checking ? query.data : undefined;
+  const accessDenied = query.error instanceof ApiError && [401, 403].includes(query.error.status);
+  const data = vault && !checking && !accessDenied ? query.data : undefined;
   const lastPage = data?.pages.at(-1);
   const showingPreviousScope = query.isPlaceholderData;
   const unsupported = Boolean(
@@ -114,9 +130,16 @@ export function useVaultTree(
   return {
     tree,
     items,
+    path: lastPage?.path,
+    accessDenied,
     complete: lastPage?.complete === true,
     paginationUnsupported: Boolean(lastPage && typeof lastPage.complete !== "boolean"),
     hasMore: query.hasNextPage,
+    pageCount: data?.pages.length ?? 0,
+    // Kind ordering puts the Collection catalog before every resource kind.
+    // A following page without Collections has passed that catalog, even if
+    // status filtering leaves the resource page empty.
+    pastCollectionCatalog: Boolean(lastPage && !lastPage.items.some(item => item.type === "collection")),
     loadingMore: query.isFetchingNextPage,
     loadMore: () => { if (!checking && options.enabled !== false && query.hasNextPage && !query.isFetching) void query.fetchNextPage(); },
     loading: items === null && !error && Boolean(vault),
@@ -126,6 +149,26 @@ export function useVaultTree(
     error,
     refetch,
   };
+}
+
+/** A browse context describes a prefix, even when that collection was deleted.
+ * Verify the actual row through its bounded parent catalog before offering it. */
+export function useCollectionProof(vault: string, path: string, enabled = true) {
+  const parent = path.split("/").slice(0, -1).join("/");
+  const query = useVaultTree(vault, "unarchived", {
+    collection: parent || undefined, content_type: "collections", depth: 0,
+    enabled: enabled && Boolean(path),
+  });
+  const row = !query.showingPreviousScope && !query.accessDenied && !query.error
+    ? query.items?.find(item => item.type === "collection" && item.path === path) : undefined;
+  const node: TreeNode | undefined = row ? { kind: "collection", name: row.name, path: row.path, raw: row } : undefined;
+  useEffect(() => {
+    // Verification is a lookup, not a directory the user should have to page.
+    if (enabled && path && !row && query.hasMore && !query.loadingMore && !query.refreshing && !query.error && !query.showingPreviousScope) query.loadMore();
+  }, [enabled, path, row, query.hasMore, query.loadingMore, query.refreshing, query.error, query.showingPreviousScope, query.pageCount, query.loadMore]);
+  return { ...query, verified: Boolean(row),
+    missing: enabled && Boolean(path) && !query.showingPreviousScope && !query.error && query.complete && !query.refreshing && !row,
+    node };
 }
 
 export function buildTree(items: BrowseItem[]): TreeNode[] {

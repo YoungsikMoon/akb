@@ -18,7 +18,7 @@ import os
 from pathlib import Path
 import stat
 import sys
-from typing import Any
+from typing import Any, Callable
 from typing import Literal
 from urllib.parse import quote, urlsplit
 from uuid import UUID, uuid4
@@ -373,9 +373,26 @@ class ExistingTargetControl(KeycloakStandaloneSSOControl):
             raise fail("target_cohort_federation_conflict")
         return user, links
 
-    async def seed_cohort(self, spec: StandaloneSSOBootstrapSpec, *, token: str) -> None:
-        resolved = []
-        for member in self.preparation.cohort:
+    def restore_cohort(self, values: list[dict[str, Any]]) -> None:
+        """A private journal may resolve UUIDs, never change the approved intent."""
+        resolved = [ExactCohortMember(**value) for value in values]
+        if len(resolved) != len(self.preparation.cohort):
+            raise fail("target_cohort_journal_mismatch")
+        for original, actual in zip(self.preparation.cohort, resolved, strict=True):
+            if (original.model_dump(exclude={"broker_subject"}) != actual.model_dump(exclude={"broker_subject"})
+                    or (original.broker_subject is not None and original.broker_subject != actual.broker_subject)):
+                raise fail("target_cohort_journal_mismatch")
+        subjects = [member.broker_subject for member in resolved if member.broker_subject is not None]
+        if len(set(subjects)) != len(subjects):
+            raise fail("target_cohort_journal_mismatch")
+        self.resolved_cohort = resolved
+
+    async def resolve_cohort(self, spec: StandaloneSSOBootstrapSpec, *, token: str,
+                             checkpoint: Callable[[], None] | None = None) -> None:
+        # An interrupted POST may not yet have a journal UUID. Resolve only the
+        # exact username carrying this operation marker, then pin its actual ID
+        # before any link/delete. A durable UUID is never replaced by a lookup.
+        for index, member in enumerate(self.resolved_cohort):
             if member.broker_subject is None:
                 users = await self._json(spec, f"/admin/realms/{quote(spec.realm, safe='')}/users", token=token,
                                          params={"username": member.broker_username, "exact": "true"},
@@ -383,11 +400,17 @@ class ExistingTargetControl(KeycloakStandaloneSSOControl):
                 if not isinstance(users, list) or len(users) > 1:
                     raise fail("target_cohort_user_conflict")
                 if users:
-                    if users[0].get("attributes", {}).get("akb.preparation.operation") != [str(self.preparation.operation_id)]:
+                    if (users[0].get("username") != member.broker_username or
+                            users[0].get("attributes", {}).get("akb.preparation.operation") != [str(self.preparation.operation_id)]):
                         raise fail("target_cohort_unowned_user")
-                    member = member.model_copy(update={"broker_subject": UUID(users[0]["id"])})
-            resolved.append(member)
-        self.resolved_cohort = resolved
+                    self.resolved_cohort[index] = member.model_copy(update={"broker_subject": UUID(users[0]["id"])})
+                    if checkpoint is not None:
+                        checkpoint()
+
+    async def seed_cohort(self, spec: StandaloneSSOBootstrapSpec, *, token: str,
+                          checkpoint: Callable[[], None] | None = None) -> None:
+        await self.resolve_cohort(spec, token=token, checkpoint=checkpoint)
+        resolved = self.resolved_cohort
         # Validate the whole cohort before creating anything.
         before = [await self.cohort_readback(spec, m, token=token, allow_missing=True) for m in resolved]
         base = f"/admin/realms/{quote(spec.realm, safe='')}"
@@ -415,6 +438,8 @@ class ExistingTargetControl(KeycloakStandaloneSSOControl):
                     raise fail("target_cohort_create_uncertain")
                 member = member.model_copy(update={"broker_subject": UUID(actuals[0]["id"])})
                 self.resolved_cohort[index] = member
+                if checkpoint is not None:
+                    checkpoint()
             path = f"{base}/users/{member.broker_subject}"
             if not links:
                 try:
@@ -430,15 +455,19 @@ class ExistingTargetControl(KeycloakStandaloneSSOControl):
                                 json_body=[role], expected=frozenset({204}))
             await self.cohort_readback(spec, member, token=token)
 
-    async def compensate_cohort(self, spec: StandaloneSSOBootstrapSpec, *, token: str) -> int:
+    async def compensate_cohort(self, spec: StandaloneSSOBootstrapSpec, *, token: str,
+                                checkpoint: Callable[[], None] | None = None) -> int:
         """Delete only exact users marked as created by this operation.
 
         Existing prelinked users are never marked or removed. Added credentials,
         changed usernames, and foreign links stop compensation rather than
         destroying state another actor has begun to use.
         """
+        await self.resolve_cohort(spec, token=token, checkpoint=checkpoint)
         deleted = 0
-        for member in self.preparation.cohort:
+        for member in self.resolved_cohort:
+            if member.broker_subject is None:
+                continue
             user, _ = await self.cohort_readback(spec, member, token=token, allow_missing=True)
             if user is None:
                 continue
@@ -494,12 +523,22 @@ async def prepare_target(preparation: HostPreparationInput, output_dir: Path, *,
         journal = json.loads(protected_read(journal_path)) if journal_path.exists() else None
         if journal is not None and journal.get("binding") != binding:
             raise fail("target_preparation_journal_mismatch")
+        if journal is not None and "cohort" in journal:
+            control.restore_cohort(journal["cohort"])
+
+        def checkpoint_cohort() -> None:
+            assert journal is not None
+            values = [member.model_dump(mode="json") for member in control.resolved_cohort]
+            control.restore_cohort(values)
+            journal["cohort"] = values
+            protected_write(journal_path, journal)
+
         bootstrap = await control.acquire_bootstrap(spec)
         if compensate_only:
             if bootstrap is None or journal is None or journal["phase"] != "preparing":
                 raise fail("target_cohort_compensation_unavailable")
             await control.require_realm(spec, token=bootstrap)
-            count = await control.compensate_cohort(spec, token=bootstrap)
+            count = await control.compensate_cohort(spec, token=bootstrap, checkpoint=checkpoint_cohort)
             return {"compensated": True, "deleted_owned_users": count}
         if bootstrap is not None:
             await control.require_realm(spec, token=bootstrap)
@@ -520,7 +559,7 @@ async def prepare_target(preparation: HostPreparationInput, output_dir: Path, *,
                     if not isinstance(secret_readback, dict) or secret_readback.get("value") != secret_value:
                         raise fail("target_client_secret_readback_mismatch")
                 await control.configure_approved_provider(spec)
-                await control.seed_cohort(spec, token=bootstrap)
+                await control.seed_cohort(spec, token=bootstrap, checkpoint=checkpoint_cohort)
                 snapshots = [await control.user_fingerprint(spec, str(member.broker_subject), token=bootstrap)
                              for member in control.resolved_cohort]
                 snapshots.append(await control.user_fingerprint(spec, readback.product_admin_subject, token=bootstrap))
@@ -558,7 +597,7 @@ async def prepare_target(preparation: HostPreparationInput, output_dir: Path, *,
         if journal["phase"] in {"published", "retiring"}:
             resolved_values = receipt.get("cohort", []) if journal["phase"] == "published" else journal.get("cohort", [])
             if resolved_values:
-                control.resolved_cohort = [ExactCohortMember(**value) for value in resolved_values]
+                control.restore_cohort(resolved_values)
         for member in control.resolved_cohort:
             await control.cohort_readback(spec, member, token=management)
         if journal["phase"] == "published":

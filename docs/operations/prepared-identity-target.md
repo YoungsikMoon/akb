@@ -62,8 +62,11 @@ projection in this phase. A private host journal and exact ownership readback
 recover uncertain creates/links and retirement responses; a retry never rotates
 a client secret or blindly recreates an uncertain user. Do not remove that
 journal while a run is incomplete. An interrupted process releases its advisory
-lock; the next run can resume. `--compensate-cohort` is available while preparation
-authority still exists and deletes only unchanged operation-owned cohort users.
+lock; the next run can resume. Each actual allocated UUID is checkpointed before
+linking. A restart can resolve an uncertain allocation only by exact username
+plus the original operation marker and durably pins that UUID before further
+work; a later same-name user cannot replace it. `--compensate-cohort` is available
+while preparation authority still exists and deletes only unchanged operation-owned cohort users.
 
 Successful output files are 0600:
 
@@ -127,7 +130,12 @@ python -m app.sso.cleanup_prepared_target \
 
 Cleanup first compares every operation-created user's actual UUID, operation
 marker, selected user state, credentials, links and role mappings with the host
-snapshot. Any concurrent change refuses deletion. Pre-existing/adopted users,
+snapshot, then rechecks each exact fingerprint immediately before its DELETE.
+A detected change refuses that deletion; final readback reports actual remaining
+objects. Keycloak user GET/DELETE is not atomic: a realm administrator or another
+writer can still change state between the last read and deletion. Perform cleanup
+in a controlled maintenance window; the command provides no server-side lock
+against full realm administration. Pre-existing/adopted users,
 clients, providers, realm administration and unrelated resources are preserved.
 After exact owned-user deletion it reads back absence and retained existing IDs,
 retires the cleanup client, and proves old-token/new-credential denial before

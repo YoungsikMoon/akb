@@ -10,7 +10,7 @@ from uuid import uuid4
 import pytest
 
 from app.services.standalone_sso_bootstrap import MANAGEMENT_REALM_ROLES, StandaloneSSOReadback
-from app.sso.prepare_target_host import HostPreparationInput, canonical, digest, protected_read, protected_write
+from app.sso.prepare_target_host import ExistingTargetControl, HostPreparationInput, canonical, digest, protected_read, protected_write
 from app.sso.adopt_prepared_target import PreparedTargetReceipt, validate_runtime_binding
 
 
@@ -117,3 +117,178 @@ def test_host_leaf_imports_no_database_or_active_settings():
     path = Path(__file__).resolve().parents[1] / "app/sso/prepare_target_host.py"
     source = path.read_text()
     assert "from app.db" not in source and "from app.config" not in source
+
+
+@pytest.mark.asyncio
+async def test_cleanup_rechecks_each_user_after_cohort_preflight(tmp_path, monkeypatch):
+    from app.sso import cleanup_prepared_target as cleanup
+
+    receipt, _, _ = bound_fixture()
+    p = preparation(operation_id=receipt.operation_id, target_id=receipt.target_id, realm_id=receipt.realm_id,
+                    org_id=receipt.org_id, source_guard={"auth_mode": "local", "runtime_generation": 1,
+                                                       "source_revision": "a" * 40})
+    subjects = [str(uuid4()), str(uuid4())]
+    assets = [{"subject": subject, "owned": True, "fingerprint_sha256": "original"} for subject in subjects]
+    receipt = receipt.model_copy(update={"source_guard": p.source_guard, "owned_assets": assets})
+    state = {asset["subject"]: dict(asset) for asset in assets}
+    deleted = []
+
+    class Control:
+        def __init__(self, _preparation):
+            pass
+
+        async def acquire_bootstrap(self, _spec):
+            return "fixture-token"
+
+        async def require_realm(self, _spec, **_kwargs):
+            pass
+
+        async def user_fingerprint(self, _spec, subject, **_kwargs):
+            # A credential/action changes while another user's preflight yields.
+            if subject == subjects[1] and subjects[0] in state:
+                state[subjects[0]]["fingerprint_sha256"] = "changed"
+            return dict(state[subject]) if subject in state else None
+
+        async def _request(self, _spec, method, path, **_kwargs):
+            assert method == "DELETE"
+            subject = path.rsplit("/", 1)[-1]
+            deleted.append(subject)
+            del state[subject]
+
+        async def retire_bootstrap(self, _spec, **_kwargs):
+            pass
+
+        async def assert_bootstrap_retired(self, _spec, **_kwargs):
+            pass
+
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(cleanup, "ExistingTargetControl", Control)
+    authority = cleanup.CleanupAuthority(operation_id=p.operation_id, target_id=p.target_id, realm_id=p.realm_id,
+                                         client_id="cleanup-once", client_secret="fixture-cleanup-material")
+    with pytest.raises(RuntimeError, match="target_cleanup_owned_user_changed"):
+        await cleanup.cleanup_target(p, receipt, authority, tmp_path / "compensation.json")
+    assert deleted == []
+    assert not (tmp_path / "compensation.json").exists()
+
+
+class InterruptedAllocationControl(ExistingTargetControl):
+    """Stateful transport fixture; real allocation/census/compensation methods run."""
+
+    def __init__(self, p, state):
+        super().__init__(p)
+        self.state = state
+
+    async def acquire_bootstrap(self, _spec):
+        return "fixture-token"
+
+    async def require_realm(self, _spec, **_kwargs):
+        pass
+
+    async def reconcile(self, _spec, **_kwargs):
+        return StandaloneSSOReadback(str(self.preparation.realm_id), str(self.preparation.product_admin_subject),
+                                    "admin", "manager", "web", "kid", 3072, 1,
+                                    MANAGEMENT_REALM_ROLES, MANAGEMENT_REALM_ROLES, "pwd", 0)
+
+    async def configure_approved_provider(self, _spec):
+        pass
+
+    async def _json(self, spec, path, **kwargs):
+        if path.endswith("/client-secret"):
+            client = path.split("/")[-2]
+            return {"value": {"web": spec.api_client_secret, "admin": spec.admin_client_secret,
+                               "manager": spec.management_client_secret}[client]}
+        if "/identity-provider/instances/" in path:
+            return {"config": {"issuer": self.preparation.cohort[0].upstream_issuer}}
+        if path.endswith("/users"):
+            return list(self.state["users"].values())
+        if path.endswith("/federated-identity"):
+            return self.state["links"].get(path.split("/")[-2], [])
+        if path.endswith("/credentials"):
+            return []
+        if "/roles/" in path:
+            return {"id": str(uuid4()), "name": "fixture-guard"}
+        raise AssertionError(path)
+
+    async def _request(self, _spec, method, path, **kwargs):
+        import httpx
+        body = kwargs.get("json_body")
+        if method == "POST" and path.endswith("/users"):
+            subject = str(uuid4())
+            self.state["users"][subject] = dict(body, id=subject)
+            return httpx.Response(201)
+        if method == "POST" and "/federated-identity/" in path:
+            self.state["links"][path.split("/")[-3]] = [body]
+            return httpx.Response(204)
+        if method == "POST" and path.endswith("/role-mappings/realm"):
+            raise RuntimeError("fixture_interrupted_after_link")
+        subject = path.rsplit("/", 1)[-1]
+        if method == "GET":
+            user = self.state["users"].get(subject)
+            return httpx.Response(200, json=user) if user else httpx.Response(404)
+        if method == "DELETE":
+            del self.state["users"][subject]
+            self.state["deleted"].append(subject)
+            self.state["links"].pop(subject, None)
+            return httpx.Response(204)
+        raise AssertionError((method, path))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing_checkpoint", [False, True])
+async def test_interrupted_allocated_cohort_journals_actual_uuid_and_compensates_after_restart(tmp_path, missing_checkpoint):
+    from app.sso.prepare_target_host import prepare_target
+
+    member = dict(akb_user_id=uuid4(), broker_subject=None, broker_username="approved-person", provider_alias="platform",
+                  upstream_issuer="https://upstream.example/realms/platform", upstream_subject="opaque")
+    p = preparation(cohort=[member])
+    state = {"users": {}, "links": {}, "deleted": []}
+    control = InterruptedAllocationControl(p, state)
+    try:
+        with pytest.raises(RuntimeError, match="fixture_interrupted_after_link"):
+            await prepare_target(p, tmp_path, control=control)
+    finally:
+        await control.aclose()
+    subject = next(iter(state["users"]))
+    journal = json.loads(protected_read(tmp_path / "host-authority-journal.json"))
+    assert journal["phase"] == "preparing"
+    assert journal["cohort"][0]["broker_subject"] == subject
+    assert state["links"][subject][0]["userId"] == "opaque"
+    if missing_checkpoint:
+        # Old/incomplete journal, including a crash after a successful POST but
+        # before readback/checkpoint: exact marked username recovers the UUID.
+        journal.pop("cohort")
+        protected_write(tmp_path / "host-authority-journal.json", journal)
+    restarted = InterruptedAllocationControl(p, state)
+    try:
+        result = await prepare_target(p, tmp_path, control=restarted, compensate_only=True)
+        assert result == {"compensated": True, "deleted_owned_users": 1}
+        assert state["deleted"] == [subject] and state["users"] == {}
+        durable = json.loads(protected_read(tmp_path / "host-authority-journal.json"))
+        assert durable["cohort"][0]["broker_subject"] == subject
+        # A later same-name object must never replace the pinned UUID.
+        replacement = str(uuid4())
+        state["users"][replacement] = {"id": replacement, "username": "approved-person", "enabled": True,
+            "attributes": {"akb.preparation.operation": [str(p.operation_id)]}}
+        assert await prepare_target(p, tmp_path, control=restarted, compensate_only=True) == {
+            "compensated": True, "deleted_owned_users": 0}
+        assert list(state["users"]) == [replacement] and state["deleted"] == [subject]
+    finally:
+        await restarted.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field,value", [("broker_username", "other"), ("upstream_subject", "other"),
+                                         ("akb_user_id", str(uuid4()))])
+async def test_recovered_cohort_cannot_widen_original_intent(field, value):
+    member = dict(akb_user_id=uuid4(), broker_subject=None, broker_username="approved-person", provider_alias="platform",
+                  upstream_issuer="https://upstream.example/realms/platform", upstream_subject="opaque")
+    p = preparation(cohort=[member])
+    control = ExistingTargetControl(p)
+    try:
+        changed = p.cohort[0].model_dump(mode="json") | {"broker_subject": str(uuid4()), field: value}
+        with pytest.raises(RuntimeError, match="target_cohort_journal_mismatch"):
+            control.restore_cohort([changed])
+    finally:
+        await control.aclose()

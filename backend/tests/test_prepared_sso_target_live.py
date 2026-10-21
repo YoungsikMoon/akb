@@ -224,6 +224,7 @@ async def test_real_keycloak_target_prepare_retirement_replay_and_pg_adoption(tm
             try:
                 with pytest.raises(RuntimeError, match="fixture_lost_native_create_response"):
                     await prepare_target(p, output, control=lossy)
+                await prove_partial_allocation(client, p, tmp_path / "partial")
                 receipt = await prepare_target(p, output, control=lossy)
                 assert (lossy.native_posts, lossy.cohort_posts, lossy.retirement_deletes) == (1, 1, 1)
             finally:
@@ -260,7 +261,36 @@ async def test_real_keycloak_target_prepare_retirement_replay_and_pg_adoption(tm
             finally:
                 await manager.aclose()
             await prove_pg_adoption(pg_source, parsed, replace(p.spec(), bootstrap_client_secret="", product_admin_password=""), (output / "target-preparation.json").read_bytes(), monkeypatch)
-            await prove_cleanup(client, p, parsed, output)
+            await prove_cleanup(client, p, parsed, output, monkeypatch)
+
+
+async def prove_partial_allocation(client, p, output):
+    member = p.cohort[0].model_copy(update={"broker_username": "interrupted-approved-person",
+                                         "upstream_subject": "interrupted-opaque"})
+    partial = p.model_copy(update={"cohort": [member]})
+
+    class InterruptedControl(ExistingTargetControl):
+        async def _request(self, spec, method, path, **kwargs):
+            response = await super()._request(spec, method, path, **kwargs)
+            if method == "POST" and path.endswith("/role-mappings/realm"):
+                raise RuntimeError("fixture_interrupted_after_link")
+            return response
+
+    control = InterruptedControl(partial)
+    try:
+        with pytest.raises(RuntimeError, match="fixture_interrupted_after_link"):
+            await prepare_target(partial, output, control=control)
+    finally:
+        await control.aclose()
+    journal = json.loads((output / "host-authority-journal.json").read_bytes())
+    subject = journal["cohort"][0]["broker_subject"]
+    actual = (await api(client, "GET", "akb/users?username=interrupted-approved-person&exact=true"))[0]
+    assert actual["id"] == subject and journal["phase"] == "preparing"
+    assert (await api(client, "GET", f"akb/users/{subject}/federated-identity"))[0]["userId"] == "interrupted-opaque"
+    # Fresh process/control uses the durable UUID, not the original null input.
+    assert await prepare_target(partial, output, compensate_only=True) == {"compensated": True, "deleted_owned_users": 1}
+    assert await api(client, "GET", "akb/users?username=interrupted-approved-person&exact=true") == []
+    assert await prepare_target(partial, output, compensate_only=True) == {"compensated": True, "deleted_owned_users": 0}
 
 
 async def negative_cohorts(client, p):
@@ -296,7 +326,7 @@ async def negative_cohorts(client, p):
         await control.aclose()
 
 
-async def prove_cleanup(client, p, receipt, output):
+async def prove_cleanup(client, p, receipt, output, monkeypatch):
     from app.sso.cleanup_prepared_target import CleanupAuthority, cleanup_target, ids_hash
 
     cid = "cleanup-once"
@@ -315,6 +345,26 @@ async def prove_cleanup(client, p, receipt, output):
     with pytest.raises(RuntimeError, match="target_cleanup_owned_user_changed"):
         await cleanup_target(p, receipt, authority, output / "cleanup-compensation.json")
     await api(client, "PUT", f"akb/users/{subject}", {"requiredActions": []}, 204)
+    from app.sso import cleanup_prepared_target as cleanup
+    first, second = [str(asset["subject"]) for asset in receipt.owned_assets]
+
+    class ChangedDuringPreflight(ExistingTargetControl):
+        changed = False
+
+        async def user_fingerprint(self, spec, current, **kwargs):
+            if current == second and not self.changed:
+                self.changed = True
+                await api(client, "PUT", f"akb/users/{first}", {"requiredActions": ["CONFIGURE_TOTP"]}, 204)
+            return await super().user_fingerprint(spec, current, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(cleanup, "ExistingTargetControl", ChangedDuringPreflight)
+        with pytest.raises(RuntimeError, match="target_cleanup_owned_user_changed"):
+            await cleanup_target(p, receipt, authority, output / "cleanup-compensation.json")
+    assert (await api(client, "GET", f"akb/users/{first}"))["requiredActions"] == ["CONFIGURE_TOTP"]
+    assert (await api(client, "GET", f"akb/users/{second}"))["id"] == second
+    assert not (output / "cleanup-compensation.json").exists()
+    await api(client, "PUT", f"akb/users/{first}", {"requiredActions": []}, 204)
     result = await cleanup_target(p, receipt, authority, output / "cleanup-compensation.json")
     assert result["remaining_owned_ids"] == [] and len(result["deleted_owned_ids"]) == 2
     assert result["preserved_existing_ids_sha256"] == ids_hash([m.akb_user_id for m in p.cohort])

@@ -97,10 +97,17 @@ async def cleanup_target(preparation: HostPreparationInput, receipt: PreparedTar
                 elif actual != asset or not actual["owned"]:
                     raise fail("target_cleanup_owned_user_changed")
                 actuals.append((subject, actual))
-            for subject, actual in actuals:
+            for (subject, actual), asset in zip(actuals, receipt.owned_assets, strict=True):
                 if actual is not None:
                     journal["pending"] = subject
                     protected_write(journal_path, journal)
+                    # Other users' preflight reads and previous deletes yield.
+                    # Recheck this exact object immediately before its DELETE.
+                    # Keycloak offers no conditional user DELETE: this narrows
+                    # the race; full realm administrators can still bypass it.
+                    fresh = await control.user_fingerprint(spec, subject, token=token)
+                    if fresh != asset or not fresh["owned"]:
+                        raise fail("target_cleanup_owned_user_changed")
                     try:
                         await control._request(spec, "DELETE", f"/admin/realms/{spec.realm}/users/{subject}",
                                                token=token, expected=frozenset({204}))

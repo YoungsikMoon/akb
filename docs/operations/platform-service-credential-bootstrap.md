@@ -53,8 +53,15 @@ sorted keys, ASCII escaping, compact separators and no trailing newline.
 A receipt proves committed issuance, not successful HTTP authentication: verify
 the credential through `/api/v1/auth/me` before publishing it to consumers.
 
-Account, token hash and issuance lineage commit in one role-authority
-transaction. The permanent lineage has no cascading user/token foreign keys
+Account, token hash, issuance lineage and the canonical PostgreSQL user-role
+projection commit in one role-authority transaction on the same connection.
+First issuance creates the NOLOGIN `akb_user_<user UUID with underscores>` role
+and its normal `akb_authenticated` membership. Projection or audit failure
+rolls back the account, token, lineage, role, membership and event together.
+The unscoped service credential does not receive a scoped `akb_token_*` role.
+Replay verifies the existing canonical membership and its options without
+recreating a missing role or restoring a revoked or changed grant. The permanent
+lineage has no cascading user/token foreign keys
 and is independent of audit retention. Identical retries only confirm the
 same unchanged live credential. A different intent, deleted/revoked/expired
 token, suspended/demoted or changed account, changed scope/class/vault authority,

@@ -12,6 +12,7 @@ import pytest
 from app.config import settings
 from app.services import auth_service, platform_service_bootstrap as bootstrap
 from app.services.role_authority import role_authority_transaction
+from app.services.role_sync import AUTHENTICATED_ROLE, RoleSync, token_role_name, user_role_name
 from tests.test_platform_service_bootstrap_unit import wire
 
 pytestmark = pytest.mark.asyncio
@@ -25,6 +26,24 @@ async def lane(monkeypatch):
     admin = await asyncpg.connect(dsn, timeout=5)
     database = "akb_service_cli_" + uuid.uuid4().hex
     pool = None
+    owned_roles = {}
+    authenticated_before = await admin.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", AUTHENTICATED_ROLE)
+    authenticated_created = None
+    original_project = RoleSync.on_user_create_in_conn
+
+    async def tracked_project(sync, conn, user_id):
+        nonlocal authenticated_created
+        role = user_role_name(user_id)
+        assert await conn.fetchval("SELECT current_database()") == database
+        assert await conn.fetchval("SELECT id FROM users WHERE id=$1 AND username='platform-bot'", uuid.UUID(str(user_id)))
+        if role not in owned_roles:
+            assert not await conn.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", role)
+        await original_project(sync, conn, user_id)
+        owned_roles[role] = await conn.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", role)
+        if authenticated_before is None:
+            authenticated_created = await conn.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", AUTHENTICATED_ROLE)
+
+    monkeypatch.setattr(RoleSync, "on_user_create_in_conn", tracked_project)
     try:
         await admin.execute(f'CREATE DATABASE "{database}"')
         target = urlunsplit(urlsplit(dsn)._replace(path="/"+database))
@@ -49,6 +68,19 @@ async def lane(monkeypatch):
         if pool:
             await pool.close()
         await admin.execute(f'DROP DATABASE IF EXISTS "{database}"')
+        # Roles are cluster-wide: exact UUID/OID ownership, never a prefix sweep.
+        for role, oid in owned_roles.items():
+            current = await admin.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", role)
+            if current is not None:
+                assert current == oid and user_role_name(uuid.UUID(role.removeprefix("akb_user_").replace("_", "-"))) == role
+                await admin.execute(f'DROP ROLE "{role}"')
+        if authenticated_before is None and authenticated_created is not None:
+            current = await admin.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", AUTHENTICATED_ROLE)
+            if current == authenticated_created:
+                assert not await admin.fetchval("SELECT EXISTS(SELECT 1 FROM pg_auth_members WHERE roleid=$1 OR member=$1)", current)
+                await admin.execute(f'DROP ROLE "{AUTHENTICATED_ROLE}"')
+        else:
+            assert await admin.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", AUTHENTICATED_ROLE) == authenticated_before
         await admin.close()
 
 
@@ -60,6 +92,13 @@ async def test_first_run_concurrent_retry_actual_authentication_and_lost_ack(lan
     for table in ("users", "tokens", "platform_service_bootstrap"):
         assert await pool.fetchval(f"SELECT count(*) FROM {table}") == 1
     assert await pool.fetchval("SELECT count(*) FROM external_identities") == 0
+    role = user_role_name(results[0]["user_id"])
+    attrs = await pool.fetchrow("SELECT rolcanlogin,rolsuper,rolcreaterole,rolcreatedb FROM pg_roles WHERE rolname=$1", role)
+    assert dict(attrs) == {"rolcanlogin": False, "rolsuper": False, "rolcreaterole": False, "rolcreatedb": False}
+    async with pool.acquire() as conn:
+        assert await RoleSync(pool).user_role_projected_in_conn(conn, results[0]["user_id"])
+    assert not await pool.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", token_role_name(intent.token_id))
+    assert await pool.fetchval("SELECT count(*) FROM events WHERE kind='auth.platform_service_bootstrapped'") == 1
     user = await auth_service.resolve_rest_user_authorization("Bearer " + intent.credential)
     assert user.user_id == results[0]["user_id"]
     assert user.username == "platform-bot" and user.email == "platform-bot@workspace-test.local"
@@ -138,13 +177,20 @@ async def test_lineageless_canonical_account_not_adopted(lane):
 
 async def test_atomic_failure_rolls_back_account_token_and_lineage(lane, monkeypatch):
     pool, intent = lane
-    async def failed(*_, **__):
+    original = bootstrap.emit_event
+    attempted_user = None
+    async def failed(conn, *args, **kwargs):
+        nonlocal attempted_user
+        attempted_user = kwargs["payload"]["user_id"]
+        await original(conn, *args, **kwargs)
         raise RuntimeError("forced event transaction failure")
     monkeypatch.setattr(bootstrap, "emit_event", failed)
     with pytest.raises(RuntimeError):
         await bootstrap.provision(intent)
-    for table in ("users", "tokens", "platform_service_bootstrap"):
+    for table in ("users", "tokens", "platform_service_bootstrap", "events"):
         assert await pool.fetchval(f"SELECT count(*) FROM {table}") == 0
+    assert attempted_user is not None
+    assert not await pool.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", user_role_name(attempted_user))
 
 
 async def test_replay_waits_for_committed_revocation_before_readback(lane):
@@ -234,3 +280,49 @@ async def test_replay_pins_original_service_client_and_runtime(lane, monkeypatch
         await bootstrap.provision(intent)
     assert await pool.fetchval("SELECT count(*) FROM users") == 1
     assert await pool.fetchval("SELECT count(*) FROM tokens") == 1
+
+
+async def test_projection_failure_rolls_back_catalog_role_membership_and_audit(lane, monkeypatch):
+    pool, intent = lane
+    original = RoleSync.on_user_create_in_conn
+    attempted_user = None
+    async def failed(sync, conn, user_id):
+        nonlocal attempted_user
+        attempted_user = user_id
+        for table in ("users", "tokens", "platform_service_bootstrap"):
+            assert await conn.fetchval(f"SELECT count(*) FROM {table}") == 1
+        await original(sync, conn, user_id)
+        assert await sync.user_role_projected_in_conn(conn, user_id)
+        raise RuntimeError("forced projection transaction failure")
+    monkeypatch.setattr(RoleSync, "on_user_create_in_conn", failed)
+    with pytest.raises(RuntimeError, match="projection transaction failure"):
+        await bootstrap.provision(intent)
+    for table in ("users", "tokens", "platform_service_bootstrap", "events"):
+        assert await pool.fetchval(f"SELECT count(*) FROM {table}") == 0
+    assert attempted_user is not None
+    assert not await pool.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", user_role_name(attempted_user))
+    assert not await pool.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", token_role_name(intent.token_id))
+
+
+@pytest.mark.parametrize("change", ["missing-role", "revoked-membership", "admin-option", "no-inherit", "no-set"])
+async def test_replay_never_restores_changed_role_projection(lane, change):
+    pool, intent = lane
+    report = await bootstrap.provision(intent)
+    role = user_role_name(report["user_id"])
+    if change == "missing-role":
+        await pool.execute(f'DROP ROLE "{role}"')
+    elif change == "revoked-membership":
+        await pool.execute(f'REVOKE "{AUTHENTICATED_ROLE}" FROM "{role}"')
+    else:
+        option = {"admin-option": "ADMIN TRUE", "no-inherit": "INHERIT FALSE", "no-set": "SET FALSE"}[change]
+        await pool.execute(f'GRANT "{AUTHENTICATED_ROLE}" TO "{role}" WITH {option}')
+    before = await pool.fetch("SELECT roleid,member,grantor,admin_option,inherit_option,set_option FROM pg_auth_members WHERE member=(SELECT oid FROM pg_roles WHERE rolname=$1) ORDER BY roleid,grantor", role)
+    for replay_only in (False, True):
+        with pytest.raises(bootstrap.BootstrapRefused, match="role_projection_changed"):
+            await bootstrap.provision(intent, replay_only=replay_only)
+    after = await pool.fetch("SELECT roleid,member,grantor,admin_option,inherit_option,set_option FROM pg_auth_members WHERE member=(SELECT oid FROM pg_roles WHERE rolname=$1) ORDER BY roleid,grantor", role)
+    assert after == before
+    assert await pool.fetchval("SELECT count(*) FROM platform_service_bootstrap") == 1
+    assert await pool.fetchval("SELECT count(*) FROM tokens") == 1
+    if change == "missing-role":
+        assert not await pool.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", role)

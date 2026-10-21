@@ -25,6 +25,7 @@ from app.config import settings
 from app.db.postgres import get_pool
 from app.repositories.events_repo import emit_event
 from app.services.role_authority import role_authority_transaction
+from app.services.role_sync import RoleSync
 from app.sso.runtime_identity import source_tuple
 
 PURPOSE = "platform-service-v1"
@@ -152,6 +153,7 @@ def runtime_identity() -> dict:
 async def provision(intent: Intent, *, replay_only: bool = False) -> dict:
     runtime = runtime_identity()
     pool = await get_pool()
+    role_sync = RoleSync(pool)
     try:
         async with pool.acquire() as conn:
             async with role_authority_transaction(conn):
@@ -182,6 +184,7 @@ async def provision(intent: Intent, *, replay_only: bool = False) -> dict:
                                        intent.org_id, intent.tenant_slug, intent.namespace, intent.owner_uid, user_id,
                                        intent.token_id, intent.intent_sha256, intent.credential_sha256, _canonical(runtime),
                                        settings.keycloak_service_admin_client_id_effective)
+                    await role_sync.on_user_create_in_conn(conn, user_id)
                     await emit_event(conn, "auth.platform_service_bootstrapped", payload={
                         "purpose": PURPOSE, "operation_id": str(intent.operation_id), "user_id": str(user_id),
                         "token_id": str(intent.token_id), "org_id": str(intent.org_id), "owner_uid": str(intent.owner_uid)})
@@ -206,6 +209,8 @@ async def provision(intent: Intent, *, replay_only: bool = False) -> dict:
                             or token["key_class"] != "service" or token["scopes"] != SCOPES or token["vault_scope"] is not None
                             or token["expires_at"] is not None or not token["live"] or token["created_at"] < user["tokens_revoked_before"]):
                         _refuse("platform_bootstrap_credential_retired")
+                    if not await role_sync.user_role_projected_in_conn(conn, user_id):
+                        _refuse("platform_bootstrap_role_projection_changed")
                     status = "replayed"
     except asyncpg.UniqueViolationError:
         _refuse("platform_bootstrap_identity_conflict")

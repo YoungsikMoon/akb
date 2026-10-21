@@ -417,6 +417,7 @@ async def _apply_pending_migrations(conn, applied: set[str]) -> None:
         "123_sso_callback_evidence.py",
         "124_prepared_sso_targets.py",  # adopt an explicitly prepared target without replacing source history
         "125_sso_operation_attempts.py",
+        "126_platform_service_bootstrap.py",  # permanent fixed-purpose service credential lineage
     ):
         if filename in applied:
             continue

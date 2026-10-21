@@ -17,6 +17,7 @@ BASE_CAPABILITIES = [
     "sso.preparation-target.v1", "auth.callback-login-evidence.v1",
     "sso.operation-attempts.v1",
     "auth.prepared-target-adoption.v1",
+    "auth.platform-service-bootstrap.v1",
 ]
 
 

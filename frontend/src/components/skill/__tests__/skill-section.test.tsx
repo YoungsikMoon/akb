@@ -180,6 +180,9 @@ describe("SkillSection", () => {
     expect(retry).toHaveBeenCalledOnce();
   });
   it("renders the editor surface for a normal vault with a guide", async () => {
+    // This case checks the ready guide, not lazy loading. Resolve the real
+    // preview so cold module transforms do not consume findByText's budget.
+    await import("../guide-preview");
     const u = userEvent.setup();
     render(wrap(<SkillSection vault="my-v" doc={DOC} canManage />));
 

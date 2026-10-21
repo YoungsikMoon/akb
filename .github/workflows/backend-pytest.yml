@@ -338,6 +338,9 @@ jobs:
             tests/test_sso_account_lifecycle_postgres.py
             tests/test_sso_account_sync_postgres.py
             tests/test_pat_issuance_postgres.py
+            # Native service bootstrap needs real transactions and role DDL;
+            # missing DSN remains a hard failure, never a unit-lane skip.
+            tests/test_platform_service_bootstrap_postgres_e2e.py
             tests/test_admin_auth_postgres.py
             tests/test_sso_identity_migration_postgres.py
             tests/test_sso_migration_actor_postgres.py

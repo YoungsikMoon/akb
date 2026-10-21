@@ -9,6 +9,14 @@ specifically; the proxy has its own log in
 
 ### Fixed
 
+- Deleting a Vault no longer fails after a legacy app adoption plan or apply.
+  Adoption plans and immutable audit evidence retain their original Vault and
+  installation UUIDs after deletion. New writes still validate live references;
+  stale plan replays return a conflict rather than recreating installations.
+  Target projections expose `vault_deleted`, and history authorization remains
+  bound to the original UUID even if a Vault name is reused.
+  Forward migration 115 preserves existing evidence without rewriting migration 077.
+
 - Native document provenance and graph orphan/name reads now use current,
   verified Native Heads instead of requiring a legacy document mirror.
   REST and MCP provenance share the same authorized, stable-identity lookup;

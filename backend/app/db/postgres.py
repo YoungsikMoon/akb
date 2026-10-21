@@ -408,6 +408,7 @@ async def _apply_pending_migrations(conn, applied: set[str]) -> None:
         "112_edges_resource_identity.py",  # anchor graph edges to native resource identity (akb#654/#655/#656)
         "113_bm25_vocab_epoch.py",  # term-id numbering epoch; writers refuse ids from an earlier one (akb#687)
         "114_user_avatars.py",  # private account photo state/revisions and bounded writes
+        "115_legacy_adoption_history.py",  # retain adoption history without preventing Vault deletion
     ):
         if filename in applied:
             continue

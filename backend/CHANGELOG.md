@@ -9,6 +9,13 @@ specifically; the proxy has its own log in
 
 ### Fixed
 
+- Native document provenance and graph orphan/name reads now use current,
+  verified Native Heads instead of requiring a legacy document mirror.
+  REST and MCP provenance share the same authorized, stable-identity lookup;
+  deleted documents are excluded and archived documents remain excluded
+  from orphan scans. Graph metadata is read in bounded pages on one
+  connection and snapshot, preserving migrated metadata and graph totals.
+
 - Table and Vault schema reads omit the optional `enum` field for
   unconstrained columns instead of returning `null`, matching the published
   OpenAPI response contract. Declared enum values, table data, constraints,

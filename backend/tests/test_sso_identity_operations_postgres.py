@@ -16,11 +16,11 @@ from fastapi.responses import JSONResponse
 import httpx
 import pytest
 
-from app.api.routes import admin_sso
+from app.api.routes import admin_sso, admin_sso_operations
 from app.config import settings
 from app.exceptions import AKBError
 from app.services import admin_auth_service, auth_service
-from app.sso import identity_operations as ops
+from app.sso import identity_operations as ops, management_targets
 from tests.test_admin_auth_postgres import _SSO_SESSION_EPOCH, _fresh_database
 from tests.test_admin_sso_routes_unit import Control, _provider
 
@@ -48,7 +48,7 @@ async def lane(monkeypatch):
         async def get_test_pool():
             return pool
 
-        for module in (ops, auth_service, admin_auth_service):
+        for module in (ops, auth_service, admin_auth_service, admin_sso_operations):
             monkeypatch.setattr(module, "get_pool", get_test_pool)
         monkeypatch.setattr(settings, "auth_mode", "sso")
         monkeypatch.setattr(settings, "keycloak_enabled", True)
@@ -59,6 +59,7 @@ async def lane(monkeypatch):
         monkeypatch.setattr(settings, "public_base_url", "https://akb.example")
         control = Control()
         monkeypatch.setattr(ops, "get_keycloak_provider_control", lambda: control)
+        monkeypatch.setattr(management_targets, "get_keycloak_provider_control", lambda: control)
         monkeypatch.setattr(admin_sso, "get_keycloak_provider_control", lambda: control)
         human, machine, target, tid, target_tid, vid = (uuid.uuid4() for _ in range(6))
         await pool.executemany("""INSERT INTO users(id,username,email,password_hash,is_admin,account_kind,auth_provider)
@@ -196,7 +197,7 @@ async def test_revision_drift_emergency_disable_and_postcheck_rollback(lane, mon
     assert drift.value.code == "sso_provider_fingerprint_conflict"
     lane["control"].providers[0] = original
     calls = 0
-    async def changed_after_write(alias, item):
+    async def changed_after_write(alias, item, target=None):
         nonlocal calls
         calls += 1
         prelink = await lane["control"].verify_identity_prelink(alias,

@@ -664,4 +664,7 @@ async def rollback_sso_identity_migration(
     )
 
 
+legacy_router = router
+router = APIRouter()
+router.include_router(legacy_router)
 router.include_router(operations_router)

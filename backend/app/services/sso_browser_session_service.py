@@ -271,6 +271,7 @@ async def create_sso_browser_session(
     token_response: Mapping[str, object],
     *,
     login_sequence: int | None = None,
+    callback_challenge_id: uuid.UUID | None = None,
 ) -> IssuedSsoBrowserSession:
     """Persist one exact-bound session after both token profiles verified."""
     if principal.profile_id != KEYCLOAK_ACCESS_V1 or user.auth_method != "oauth":
@@ -447,6 +448,14 @@ async def create_sso_browser_session(
                 idle_expiry,
                 absolute_expiry,
             )
+            if callback_challenge_id is not None:
+                from app.sso.callback_evidence import record_callback
+                from app.exceptions import AKBError
+                try:
+                    await record_callback(conn, callback_challenge_id, user_id=user_id,
+                                          issuer=issuer, subject=subject, provider_alias=provider_alias)
+                except AKBError:
+                    raise AuthenticationError("SSO login evidence is unavailable") from None
             await emit_event(
                 conn,
                 "auth.sso_browser_session_created",

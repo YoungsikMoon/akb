@@ -6,10 +6,10 @@ provider-management API. Assigning ownership is a human administrator ceremony,
 not a side effect of a controller discovering an alias. No controller name,
 private alias or external platform URL is built into this contract.
 
-This API controls the currently configured SSO realm. It does not prepare a
-different target realm while the installation still verifies a source issuer
-or runs in local mode. That requires a separate management-only target contract;
-these capabilities must not be counted as proof of pre-switch preparation.
+The active-realm paths retain standalone administration. Installed management
+only targets additionally allow preparation of another realm while the source
+verifier stays unchanged, including a local source. A management target never
+becomes a second verifier, a public login choice or an OIDC credential issuer.
 
 ## Discover and adopt
 
@@ -25,6 +25,8 @@ Capabilities return `schema_version: 1`, the database-owned `installation_id`,
 - `sso.provider-ownership.v1`
 - `sso.identity-operation.v1`
 - `sso.enabled-exact-admission.v1`
+- `sso.preparation-target.v1`
+- `auth.callback-login-evidence.v1`
 
 `realm_identity` is `{realm_id, realm_name, issuer}` from an actual Admin REST
 read of the configured realm. Missing permission, delegated management and
@@ -34,8 +36,8 @@ or a bootstrap marker does not establish that the realm UUID survived a restore.
 The normal management client needs `view-realm`, already part of the bundled
 management role set. No arbitrary realm URL is accepted in the request.
 
-Ownership readback contains `{schema_version, provider_alias, owner_id,
-revision, fingerprint, drifted, emergency_disabled}`. For an absent alias,
+Ownership readback contains `{schema_version, target_id, provider_alias, owner_id,
+revision, fingerprint, drifted, emergency_disabled, provider_secret_revision}`. For an absent alias,
 `owner_id` is null and `revision` is initially zero. A human adopts or reserves
 an alias with:
 
@@ -153,8 +155,116 @@ and adopt the live fingerprint before issuing another operation.
 
 Human administrators inspect a secret-free operation with
 `GET /admin/sso/identity-operations/{id}` and retire it with
-`POST /admin/sso/identity-operations/{id}/retire`. Retirement is idempotent and
-retains the journal. No automatic Keycloak user/link deletion is performed.
+`POST /admin/sso/identity-operations/{id}/retire`. Those paths also accept the
+bounded operation carrier while valid. Retirement retains the journal. No
+automatic Keycloak user/link deletion is performed.
+
+## Installed management targets
+
+Set `sso_management_targets_file` to an installation-owned secret-store file.
+The default is empty and exposes no preparation target. The JSON document is:
+
+```json
+{
+  "schema_version": 1,
+  "targets": [{
+    "target_id": "<stable installation-owned UUID>",
+    "realm_id": "<actual Keycloak realm UUID>",
+    "realm_name": "workspace",
+    "issuer": "https://login.example/realms/workspace",
+    "internal_url": "http://private-keycloak:8080",
+    "management_client_id": "akb-sso-manager",
+    "management_client_secret": "<secret-store value>",
+    "session_epoch": "<future installed runtime epoch UUID>",
+    "verify_ssl": true
+  }]
+}
+```
+
+The regular file must be owned by root or the process UID and mode `0400` or
+`0600`. Its contents are never returned by HTTP. The issuer must be canonical
+for the installed realm; callers cannot register URLs or override credentials.
+After switching, `sso_prepared_target_id` selects the installed target UUID for
+the separate prepared-bootstrap receipt contract; its default remains empty.
+The narrow management client must already exist. Preparing it is an independent
+host-side Keycloak ceremony; this API does not grant realm administration.
+
+`GET /admin/sso/targets` returns the installation ID, active target ID, exact
+source tuple and installed target metadata. Every realm identity is read from
+that target's actual Admin REST endpoint. A failed read is unknown, not a healthy
+realm. `GET /admin/sso/targets/{target_id}/providers` returns the existing schema1
+provider catalog envelope with `target_id`; its `auth_mode: sso` describes the
+management target, while inventory `source` describes the active verifier.
+Target-specific ownership GET/PUT append `/providers/{alias}/ownership`.
+Ownership is keyed by target UUID and canonical alias, so identical aliases in
+source and preparation realms do not collide. Durable issuer/UUID pins reject
+remapping or fallback after a target file is removed, including local sources. After a verifier switch, active
+legacy paths resolve the same installed target UUID, independently of epoch.
+
+Target grants add `target_id`, `expected_target_realm_id`,
+`target_session_epoch`, `expected_target_runtime_generation`,
+`expected_target_source_revision` (full source SHA or null), and `expected_source`:
+`{auth_mode, issuer, runtime_generation, sso_session_epoch, source_revision}`.
+Local source issuer/epoch are null. Every request pins the protected target
+configuration and actual realm UUID. Removed, changed or recreated targets fail
+closed; no source-control or broader-credential fallback exists.
+
+All provider and identity mutations require the exact original source tuple
+still live in the database and process. After transition, only status, challenge,
+event read and retirement accept the explicit future target tuple, whose
+generation must advance. No caller boolean can assert that transition occurred.
+Identity prelink still requires the exact existing upstream binding; installing
+management credentials does not convert local or different-issuer accounts.
+
+Optional grant `provider_secret_revision` becomes known ownership metadata only
+when the approved configure request supplies an actual nonnull `client_secret`.
+Omitting that secret preserves an already verified version; visible drift makes
+readback return null. Version metadata alone does not prove masked Keycloak
+secret contents. Keep the approved request digest and host secret-store receipt.
+
+Operation status includes `target_id`, `source_tuple`, `target_epoch`, current
+`provider_revision`, `cohort_sha256`, `phase`, and nullable
+`existing_identity_ids_hash` / `prepared_identity_ids_hash`. Phases are
+`granted`, `preparing`, `prepared`, `retired`. Hashes are SHA256 of canonical JSON
+sorted AKB UUID arrays, populated only after actual whole-cohort inspection;
+prepared is set only when every exact binding is linked. Explicit `postcheck`
+uses the same safe inspection contract as preflight.
+
+## Actual callback login evidence
+
+Grant `login-evidence` for the exact identity cohort. The bounded carrier can
+POST `/admin/sso/identity-operations/{id}/login-challenges` with
+`{"akb_user_id":"<cohort UUID>"}`. The response contains operation/challenge/user
+IDs, expiry and a no-store `login_url` with an opaque challenge. Only its hash is
+stored. A browser can start it only under the exact granted target runtime.
+Optional `request_id` is a durable per-user attempt UUID. Reusing it returns the
+same challenge and original expiry; another user conflicts. The opaque value is
+derived from the authenticated operation credential, so retry needs no plaintext
+credential storage. The server carries the challenge ID in its one-use nonce/PKCE
+OIDC state.
+
+The actual Keycloak callback verifies both token profiles, resolves the exact
+existing AKB identity, and creates the opaque browser session. In that same
+transaction it consumes the challenge and records the event. Invalid state,
+unverified claims, revoked bindings, expired authority or stale runtime cannot
+create evidence. A query parameter or a platform callback is not login proof.
+There is no event writer API.
+
+GET `/admin/sso/identity-operations/{id}/login-events` with exact
+`akb_user_id` and `challenge_id` accepts the bounded carrier or the exact
+original actor service PAT. Another token or a user outside the cohort is denied.
+It returns `events` bound to operation/challenge, installation/target, canonical
+AKB user, verified issuer/provider/subject, runtime generation/epoch/source SHA,
+cohort hash, occurrence time and nullable provider/secret revision. Empty results
+are not success. A consumer must require a fresh event matching its transition
+journal, exact target tuple and known provider/secret revision (or an independent
+fresh journal supplement); null means unknown and cannot establish finality.
+
+GET `/auth/identity-capabilities` is public secret-free corroboration with
+schema1, supported behavior names and the actual active source tuple. Source
+revision is the baked full40-character SHA or null; a product version is never
+substituted. This endpoint cannot attest to its own image provenance or Pod
+digest, which remain deployment-owned evidence.
 
 ## Trust boundary and artifact evidence
 

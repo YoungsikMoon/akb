@@ -411,6 +411,8 @@ async def _apply_pending_migrations(conn, applied: set[str]) -> None:
         "115_legacy_adoption_history.py",  # retain adoption history without preventing Vault deletion
         "116_publication_password_budgets.py",  # shared password-attempt accounting across API replicas
         "116_sso_identity_operations.py",  # exact short-lived migration authority and provider ownership
+        "117_sso_management_targets.py",
+        "118_sso_callback_evidence.py",
     ):
         if filename in applied:
             continue

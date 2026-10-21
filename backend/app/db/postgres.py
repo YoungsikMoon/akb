@@ -409,6 +409,7 @@ async def _apply_pending_migrations(conn, applied: set[str]) -> None:
         "113_bm25_vocab_epoch.py",  # term-id numbering epoch; writers refuse ids from an earlier one (akb#687)
         "114_user_avatars.py",  # private account photo state/revisions and bounded writes
         "115_legacy_adoption_history.py",  # retain adoption history without preventing Vault deletion
+        "116_publication_password_budgets.py",  # shared password-attempt accounting across API replicas
     ):
         if filename in applied:
             continue

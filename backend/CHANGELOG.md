@@ -9,6 +9,18 @@ specifically; the proxy has its own log in
 
 ### Fixed
 
+- Password-protected publications now share their attempt budget across API
+  replicas and process restarts. PostgreSQL atomically reserves each attempt
+  before verification; per-IP and publication-wide backoff retain their
+  existing thresholds and quiet-hour decay. Manager/token access remains
+  available during anonymous lockout. Reservation failures return 503 rather
+  than silently disabling protection; failed refunds retain conservative state
+  without failing an already-verified view. State is bounded per publication
+  and removed with the publication. Migration 116 is required on every API;
+  the shared guarantee begins once all API replicas run this version. Manager
+  password requests also return 503 if reservations are unavailable; existing
+  valid publication tokens continue to bypass password accounting.
+
 - Apps can observe and resume their own rollout while its only installation
   is installing, upgrading, or blocked. Authority is checked against that
   job's live targets and current grants, including original request and resume replays;

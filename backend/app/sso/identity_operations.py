@@ -64,21 +64,31 @@ def provider_fingerprint(provider, *, alias: str | None = None) -> str:
     return _digest(provider.admin_view() if provider is not None else {"provider_alias": alias, "state": "absent"})
 
 
-async def _provider(alias: str, *, allow_missing: bool = False):
+def _canonical_alias(alias: str) -> str:
     try:
-        validate_alias(alias)
+        canonical = validate_alias(alias)
     except ProviderDefinitionError:
         raise _error("provider_alias_invalid", 422) from None
+    # Keycloak's provider adapter normalizes NFC and strips whitespace. Never
+    # authorize or lock a different spelling from the alias it will mutate.
+    if canonical != alias:
+        raise _error("provider_alias_invalid", 422)
+    return canonical
+
+
+async def _provider(alias: str, *, allow_missing: bool = False, allow_configuration_error: bool = False):
+    alias = _canonical_alias(alias)
     providers = await get_keycloak_provider_control().list_providers(force_refresh=True)
     selected = [provider for provider in providers if provider.alias == alias]
     if not selected and allow_missing:
         return None
-    if len(selected) != 1 or selected[0].state == "configuration_error":
+    if len(selected) != 1 or (selected[0].state == "configuration_error" and not allow_configuration_error):
         raise _error("sso_operation_provider_unavailable")
     return selected[0]
 
 
 async def _alias_lock(conn, alias: str):
+    alias = _canonical_alias(alias)
     await conn.execute("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", f"sso-provider-owner:{alias}")
 
 
@@ -97,7 +107,7 @@ async def capabilities() -> dict[str, Any]:
 
 
 async def ownership(alias: str) -> dict[str, Any]:
-    provider = await _provider(alias, allow_missing=True)
+    provider = await _provider(alias, allow_missing=True, allow_configuration_error=True)
     pool = await get_pool()
     row = await pool.fetchrow("SELECT * FROM sso_provider_ownership WHERE alias=$1", alias)
     return {"schema_version": 1, "provider_alias": alias,
@@ -110,6 +120,7 @@ async def ownership(alias: str) -> dict[str, Any]:
 
 async def set_ownership(alias: str, *, owner_id: str | None, expected_revision: int,
                         expected_fingerprint: str, clear_emergency: bool, actor_id: uuid.UUID) -> dict[str, Any]:
+    alias = _canonical_alias(alias)
     if owner_id is not None and (not owner_id or len(owner_id) > 255
         or any(ord(character) < 0x20 or ord(character) == 0x7f for character in owner_id)):
         raise _error("sso_provider_owner_invalid", 422)
@@ -119,7 +130,7 @@ async def set_ownership(alias: str, *, owner_id: str | None, expected_revision: 
         row = await conn.fetchrow("SELECT * FROM sso_provider_ownership WHERE alias=$1 FOR UPDATE", alias)
         if (row["revision"] if row else 0) != expected_revision:
             raise _error("sso_provider_revision_conflict")
-        provider = await _provider(alias, allow_missing=True)
+        provider = await _provider(alias, allow_missing=True, allow_configuration_error=owner_id is None)
         fingerprint = provider_fingerprint(provider, alias=alias)
         if fingerprint != expected_fingerprint:
             raise _error("sso_provider_fingerprint_conflict")
@@ -143,6 +154,7 @@ async def provider_mutation_guard(alias: str, actor, *, enabled: bool | None = N
     Unowned providers retain standalone management. Releasing/adopting ownership
     is a separate, explicit human-admin CAS operation.
     """
+    alias = _canonical_alias(alias)
     pool = await get_pool()
     async with pool.acquire() as conn, conn.transaction():
         await _alias_lock(conn, alias)
@@ -162,17 +174,31 @@ async def provider_mutation_guard(alias: str, actor, *, enabled: bool | None = N
 
 async def _live_actor(conn, row):
     # Locks serialize token revocation and human demotion with the mutation.
-    machine = await conn.fetchrow("""SELECT t.id FROM tokens t JOIN users u ON u.id=t.user_id
+    machine = await conn.fetchrow("""SELECT t.id,t.expires_at FROM tokens t JOIN users u ON u.id=t.user_id
         WHERE t.id=$1 AND t.user_id=$2 AND t.key_class='service'
         AND t.scopes @> ARRAY['read','write','admin']::text[]
-        AND (t.expires_at IS NULL OR t.expires_at>NOW())
+        AND (t.expires_at IS NULL OR t.expires_at>clock_timestamp())
         AND u.account_status='active' AND u.account_kind='service' AND u.is_admin
         FOR SHARE OF t,u""", row["actor_token_id"], row["actor_id"])
     human = await conn.fetchrow("""SELECT id FROM users WHERE id=$1 AND is_admin
         AND account_status='active' AND account_kind='human' AND auth_provider='keycloak' FOR SHARE""",
         row["granted_by"])
-    if machine is None or human is None:
+    now = await conn.fetchval("SELECT clock_timestamp()")
+    if machine is None or human is None or (machine["expires_at"] is not None and machine["expires_at"] <= now):
         raise _error("sso_operation_actor_retired", 403)
+    return machine["expires_at"]
+
+
+async def _check_window(conn, row, request, *, actor_expires_at=None):
+    # NOW() is the transaction start time and can remain valid after a lock
+    # wait crosses expiry. Recheck the real clock after waits and before effects.
+    now = await conn.fetchval("SELECT clock_timestamp()")
+    if row["retired_at"] is not None or row["expires_at"] <= now:
+        raise _error("sso_operation_retired", 403)
+    if actor_expires_at is not None and actor_expires_at <= now:
+        raise _error("sso_operation_actor_retired", 403)
+    if request["issued_at"].tzinfo is None or not timedelta(seconds=0) <= now-request["issued_at"] <= timedelta(seconds=300):
+        raise _error("sso_operation_nonce_expired", 403)
 
 
 async def grant(spec: dict[str, Any], *, granted_by: uuid.UUID) -> dict[str, Any]:
@@ -253,7 +279,7 @@ async def _verify_item(alias: str, item):
         broker_subject=item["broker_subject"], upstream_subject=item["upstream_subject"])
 
 
-async def _execute_provider(conn, row, request, request_hash):
+async def _execute_provider(conn, row, request, request_hash, actor_expires_at):
     """One preapproved provider write through the existing security profile.
 
     The journal stores a digest and redacted readback, never the payload. A
@@ -277,11 +303,14 @@ async def _execute_provider(conn, row, request, request_hash):
             raise _error("sso_operation_request_invalid", 422) from None
         if spec.client_secret is not None and not isinstance(spec.client_secret, str):
             raise _error("sso_operation_request_invalid", 422)
+        await _check_window(conn, row, request, actor_expires_at=actor_expires_at)
         mutation = await control.configure(ProviderConfigureSpec(alias=row["provider_alias"], **spec.model_dump()))
     else:
         if payload:
             raise _error("sso_operation_payload_conflict", 403)
+        await _check_window(conn, row, request, actor_expires_at=actor_expires_at)
         mutation = await control.set_enabled(row["provider_alias"], enabled=verb == "enable")
+    await _check_window(conn, row, request, actor_expires_at=actor_expires_at)
     revision = row["current_provider_revision"] + 1
     fingerprint = provider_fingerprint(mutation.after)
     await conn.execute("""UPDATE sso_provider_ownership SET revision=$2,fingerprint=$3,
@@ -308,11 +337,7 @@ async def execute(operation_id: uuid.UUID, credential: str, request: dict[str, A
         row = await conn.fetchrow("SELECT * FROM sso_identity_operations WHERE operation_id=$1 FOR UPDATE", operation_id)
         if row is None or not secrets.compare_digest(row["credential_hash"], hashlib.sha256(credential.encode()).hexdigest()):
             raise _error("sso_operation_credential_invalid", 401)
-        now = await conn.fetchval("SELECT NOW()")
-        if row["retired_at"] is not None or row["expires_at"] <= now:
-            raise _error("sso_operation_retired", 403)
-        if request["issued_at"].tzinfo is None or not timedelta(seconds=0) <= now-request["issued_at"] <= timedelta(seconds=300):
-            raise _error("sso_operation_nonce_expired", 403)
+        await _check_window(conn, row, request)
         authority = current_sso_session_authority()
         await lock_active_sso_session_epoch(conn, authority)
         if (row["runtime_generation"], row["session_epoch"]) != (authority.runtime_generation, authority.session_epoch):
@@ -320,7 +345,7 @@ async def execute(operation_id: uuid.UUID, credential: str, request: dict[str, A
         installation = await conn.fetchval("SELECT installation_id FROM sso_operation_installation WHERE singleton")
         if row["installation_id"] != installation:
             raise _error("sso_operation_installation_conflict")
-        await _live_actor(conn, row)
+        actor_expires_at = await _live_actor(conn, row)
         await _alias_lock(conn, row["provider_alias"])
         owner = await conn.fetchrow("SELECT * FROM sso_provider_ownership WHERE alias=$1 FOR UPDATE", row["provider_alias"])
         if not owner or (owner["owner_id"], owner["revision"], owner["fingerprint"]) != (row["owner_id"], row["current_provider_revision"], row["current_provider_fingerprint"]):
@@ -330,6 +355,7 @@ async def execute(operation_id: uuid.UUID, credential: str, request: dict[str, A
         provider = await _provider(row["provider_alias"], allow_missing=not bool(set(row["verbs"]) & IDENTITY_VERBS))
         if provider_fingerprint(provider, alias=row["provider_alias"]) != row["current_provider_fingerprint"]:
             raise _error("sso_provider_fingerprint_conflict")
+        await _check_window(conn, row, request, actor_expires_at=actor_expires_at)
         previous = await conn.fetchrow("SELECT * FROM sso_identity_operation_requests WHERE operation_id=$1 AND nonce=$2", operation_id, request["nonce"])
         if previous:
             if previous["request_sha256"] != request_hash:
@@ -340,7 +366,7 @@ async def execute(operation_id: uuid.UUID, credential: str, request: dict[str, A
         if verb not in VERBS or verb not in row["verbs"]:
             raise _error("sso_operation_scope_forbidden", 403)
         if verb in PROVIDER_VERBS:
-            return await _execute_provider(conn, row, request, request_hash)
+            return await _execute_provider(conn, row, request, request_hash, actor_expires_at)
         if request.get("payload") is not None or not 0 <= index < len(cohort):
             raise _error("sso_operation_scope_forbidden", 403)
         item = cohort[index]
@@ -358,6 +384,7 @@ async def execute(operation_id: uuid.UUID, credential: str, request: dict[str, A
         before, snapshot = await identity_migration._inspect_in_conn(conn, user_id=uid,
             old_issuer=prelink.upstream_issuer, old_subject=item["upstream_subject"],
             new_issuer=prelink.broker_issuer, new_subject=item["broker_subject"], lock_user=True)
+        await _check_window(conn, row, request, actor_expires_at=actor_expires_at)
         state = before.state
         changed = False
         if verb in {"apply", "admit"} and state == "ready_to_link":
@@ -382,6 +409,7 @@ async def execute(operation_id: uuid.UUID, credential: str, request: dict[str, A
         confirmed = await _verify_item(row["provider_alias"], item)
         if confirmed != prelink or provider_fingerprint(await _provider(row["provider_alias"])) != row["current_provider_fingerprint"]:
             raise _error("identity_migration_prelink_changed")
+        await _check_window(conn, row, request, actor_expires_at=actor_expires_at)
         result = {"schema_version": 1, "operation_id": str(operation_id), "nonce": str(request["nonce"]),
                   "verb": verb, "item_index": index, "user_id": str(uid), "state": state, "binding_changed": changed}
         await conn.execute("""INSERT INTO sso_identity_operation_requests(operation_id,nonce,request_sha256,result)

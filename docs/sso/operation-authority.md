@@ -51,6 +51,12 @@ an alias with:
 Send this to `PUT /admin/sso/providers/{alias}/ownership`. Every successful
 change advances the revision. `owner_id: null` explicitly releases ownership.
 Fingerprint and revision mismatches fail rather than adopting a stale read.
+Alias spelling must already be canonical: whitespace or other normalization
+changes are rejected before ownership lookup, locking or provider control.
+An invalid provider configuration remains inspectable and fingerprintable.
+A human can release its ownership with the live CAS values and repair it through
+the ordinary configuration API; new grants and execution remain blocked until
+the provider is valid.
 
 Ordinary configure and enable requests for an owned alias are forbidden. A
 human administrator may still disable it through the existing API. This records
@@ -127,6 +133,8 @@ operation's expiry. The same nonce and request digest return the stored result;
 changing the digest is a conflict. Retirement, revoked/expired actor tokens,
 granting-admin demotion, runtime changes, ownership changes and drift reject
 both new writes and credential-based replays.
+Expiry uses the current database wall clock after lock waits and immediately
+before effects; waiting behind another operation does not extend authority.
 
 `apply` and `rollback` require the provider disabled. `admit` is a separate,
 explicitly granted verb for an enabled provider and the same proven exact

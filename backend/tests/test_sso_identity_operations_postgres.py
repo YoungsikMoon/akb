@@ -6,6 +6,7 @@ the disposable broker-chain fixture, not this database/HTTP contract suite.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import uuid
@@ -402,3 +403,152 @@ async def test_machine_identity_binding_requires_operation_but_exact_projection_
         same = await client.post("/api/v1/admin/users/ensure-external-identity", headers=headers, json=payload)
         assert same.status_code == 200 and same.json()["user_id"] == str(lane["target"])
     await assert_continuity(lane)
+
+
+def review_http_client():
+    app = FastAPI()
+    app.include_router(admin_sso.router, prefix="/api/v1")
+
+    @app.exception_handler(AKBError)
+    async def error(_request, exc):
+        return JSONResponse({"code": exc.code}, status_code=exc.status_code)
+
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="https://akb.example")
+
+
+async def review_human_cookies(client):
+    identity = await admin_auth_service.resolve_prebound_sso_product_admin({"iss": NEW, "sub": "admin-subject"})
+    issued = await admin_auth_service.create_sso_admin_browser_session(identity,
+        {"iss": NEW, "sub": "admin-subject", "sid": "review-fixture-human",
+         "exp": int((datetime.now(timezone.utc)+timedelta(minutes=10)).timestamp())})
+    client.cookies.set("__Host-akb_admin_session", issued.token)
+    client.cookies.set("__Host-akb_admin_csrf", issued.csrf_token)
+    return {"X-AKB-Admin-CSRF": issued.csrf_token}
+
+
+async def test_review_noncanonical_alias_cannot_bypass_owned_provider_guard(lane, monkeypatch):
+    from app.sso.providers.keycloak_oidc import validate_alias
+
+    control = lane["control"]
+    called = []
+    original_configure, original_toggle = control.configure, control.set_enabled
+    async def configure(spec):
+        # Exercise the production adapter's alias normalization after the guard.
+        canonical = validate_alias(spec.alias)
+        called.append(("configure", canonical))
+        return await original_configure(replace(spec, alias=canonical))
+    async def toggle(alias, *, enabled):
+        canonical = validate_alias(alias)
+        called.append(("enable" if enabled else "disable", canonical))
+        return await original_toggle(canonical, enabled=enabled)
+    monkeypatch.setattr(control, "configure", configure)
+    monkeypatch.setattr(control, "set_enabled", toggle)
+    payload = {"provider_type": "keycloak-oidc", "display_name": "Company SSO", "issuer": OLD,
+               "discovery_url": OLD+"/.well-known/openid-configuration", "client_id": "akb-broker"}
+    async with review_http_client() as client:
+        pat = {"Authorization": "Bearer "+lane["raw_pat"]}
+        results = [await client.put("/api/v1/admin/sso/providers/%20workforce%20", headers=pat, json=payload)]
+        for verb in ("enable", "disable"):
+            results.append(await client.post(f"/api/v1/admin/sso/providers/%20workforce%20/{verb}", headers=pat))
+        assert [result.status_code for result in results] == [422, 422, 422]
+        assert called == []
+        assert (await ops.ownership("workforce"))["revision"] == 1
+        human = await review_human_cookies(client)
+        raw_disable = await client.post("/api/v1/admin/sso/providers/%20workforce%20/disable", headers=human)
+        assert raw_disable.status_code == 422
+        assert (await ops.ownership("workforce"))["revision"] == 1
+        canonical_disable = await client.post("/api/v1/admin/sso/providers/workforce/disable", headers=human)
+        assert canonical_disable.status_code == 200
+        owner = await ops.ownership("workforce")
+        assert owner["revision"] == 2 and owner["emergency_disabled"]
+        assert called == [("disable", "workforce")]
+
+
+async def review_waiting_transaction(pool):
+    async with asyncio.timeout(10):
+        while True:
+            waiting = await pool.fetchrow("""SELECT xact_start,query FROM pg_stat_activity
+                WHERE datname=current_database() AND wait_event_type='Lock'
+                AND pid<>pg_backend_pid() ORDER BY xact_start LIMIT 1""")
+            if waiting:
+                return waiting
+            await asyncio.sleep(0.01)
+
+
+@pytest.mark.parametrize("gate", ["operation", "actor_token", "provider_lock"])
+async def test_review_expiry_while_waiting_for_authority_locks_cannot_write(lane, gate):
+    pool = lane["pool"]
+    grant = await ops.grant(lane["spec"], granted_by=lane["human"])
+    body = request()
+    pending = None
+    if gate == "provider_lock":
+        await pool.execute("""WITH deadline AS (SELECT clock_timestamp()+INTERVAL '3 seconds' AS at)
+            UPDATE sso_identity_operations SET created_at=deadline.at-INTERVAL '600 seconds',
+            expires_at=deadline.at FROM deadline WHERE operation_id=$1""", lane["spec"]["operation_id"])
+    try:
+        async with pool.acquire() as holder, holder.transaction():
+            if gate == "operation":
+                await holder.fetchrow("SELECT operation_id FROM sso_identity_operations WHERE operation_id=$1 FOR UPDATE", lane["spec"]["operation_id"])
+            elif gate == "actor_token":
+                await holder.fetchrow("SELECT id FROM tokens WHERE id=$1 FOR UPDATE", lane["tid"])
+            else:
+                await ops._alias_lock(holder, "workforce")
+            pending = asyncio.create_task(run(lane, grant, body))
+            waiting = await review_waiting_transaction(pool)
+            deadline = waiting["xact_start"]+timedelta(milliseconds=10)
+            if gate == "operation":
+                await holder.execute("UPDATE sso_identity_operations SET created_at=$2::timestamptz-INTERVAL '600 seconds',expires_at=$2::timestamptz WHERE operation_id=$1",
+                                     lane["spec"]["operation_id"], deadline)
+            elif gate == "actor_token":
+                await holder.execute("UPDATE tokens SET expires_at=$2 WHERE id=$1", lane["tid"], deadline)
+            else:
+                deadline = await holder.fetchval("SELECT expires_at FROM sso_identity_operations WHERE operation_id=$1", lane["spec"]["operation_id"])
+                assert waiting["xact_start"] < deadline
+            async with asyncio.timeout(10):
+                while not await holder.fetchval("SELECT clock_timestamp()>$1", deadline):
+                    await asyncio.sleep(0.01)
+        with pytest.raises(AKBError) as expired:
+            await pending
+        assert expired.value.code == ("sso_operation_actor_retired" if gate == "actor_token" else "sso_operation_retired")
+    finally:
+        if pending is not None:
+            if not pending.done():
+                pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+    assert await pool.fetchval("SELECT COUNT(*) FROM sso_identity_operation_requests") == 0
+    assert await pool.fetchval("SELECT COUNT(*) FROM external_identities WHERE user_id=$1", lane["target"]) == 1
+    await assert_continuity(lane)
+
+
+async def test_review_invalid_owned_provider_can_be_inspected_released_and_reconfigured(lane, monkeypatch):
+    grant = await ops.grant(lane["spec"], granted_by=lane["human"])
+    control = lane["control"]
+    control.providers[0] = replace(control.providers[0], state="configuration_error", issuer=None)
+    with pytest.raises(AKBError) as unavailable:
+        await run(lane, grant, request())
+    assert unavailable.value.code == "sso_operation_provider_unavailable"
+    with pytest.raises(AKBError) as cannot_grant:
+        await ops.grant({**lane["spec"], "operation_id": uuid.uuid4()}, granted_by=lane["human"])
+    assert cannot_grant.value.code == "sso_operation_provider_unavailable"
+    original_configure = control.configure
+    async def configure(spec):
+        result = await original_configure(spec)
+        control.providers = [result.after]
+        return result
+    monkeypatch.setattr(control, "configure", configure)
+    async with review_http_client() as client:
+        metadata = await client.get("/api/v1/admin/sso/providers/workforce/ownership",
+            headers={"Authorization": "Bearer "+lane["raw_pat"]})
+        assert metadata.status_code == 200
+        observed = metadata.json()
+        assert observed["drifted"] and observed["owner_id"] == "controller-instance"
+        human = await review_human_cookies(client)
+        released = await client.put("/api/v1/admin/sso/providers/workforce/ownership", headers=human,
+            json={"owner_id": None, "expected_revision": observed["revision"],
+                  "expected_fingerprint": observed["fingerprint"]})
+        assert released.status_code == 200 and released.json()["owner_id"] is None
+        configured = await client.put("/api/v1/admin/sso/providers/workforce", headers=human,
+            json={"provider_type": "keycloak-oidc", "display_name": "Company SSO", "issuer": OLD,
+                  "discovery_url": OLD+"/.well-known/openid-configuration", "client_id": "akb-broker"})
+        assert configured.status_code == 200 and configured.json()["provider"]["state"] == "configured_disabled"
+    assert not (await ops.ownership("workforce"))["drifted"]

@@ -410,6 +410,7 @@ async def _apply_pending_migrations(conn, applied: set[str]) -> None:
         "114_user_avatars.py",  # private account photo state/revisions and bounded writes
         "115_legacy_adoption_history.py",  # retain adoption history without preventing Vault deletion
         "116_publication_password_budgets.py",  # shared password-attempt accounting across API replicas
+        "116_sso_identity_operations.py",  # exact short-lived migration authority and provider ownership
     ):
         if filename in applied:
             continue

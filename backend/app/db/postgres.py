@@ -410,6 +410,8 @@ async def _apply_pending_migrations(conn, applied: set[str]) -> None:
         "114_user_avatars.py",  # private account photo state/revisions and bounded writes
         "115_legacy_adoption_history.py",  # retain adoption history without preventing Vault deletion
         "116_publication_password_budgets.py",  # shared password-attempt accounting across API replicas
+        "117_native_recent_order.py",  # newest-first live document feed, without a catalog-wide sort
+        "118_table_page_order.py",  # default stable table pages use an ordered index, not a full-table sort
     ):
         if filename in applied:
             continue

@@ -147,8 +147,8 @@ function TablePageContent({ accountScope, accessChecking, accessRevision }: {
     staleTime: 0,
   });
   const catalogQuery = useQuery({
-    queryKey: ["vault-tables", vault, accountScope],
-    queryFn: ({ queryKey, signal }) => readWithAccessBoundary(queryClient, queryKey, async () => ({ ...await listVaultTables(vault!), queryAccessRevision: accessRevision }), signal),
+    queryKey: ["vault-tables", vault, accountScope, "schema-only"],
+    queryFn: ({ queryKey, signal }) => readWithAccessBoundary(queryClient, queryKey, async () => ({ ...await listVaultTables(vault!, { includeRowCounts: false }), queryAccessRevision: accessRevision }), signal),
     enabled: Boolean(vault) && !accessChecking,
     staleTime: 0,
   });
@@ -158,6 +158,7 @@ function TablePageContent({ accountScope, accessChecking, accessRevision }: {
       vault,
       table,
       accountScope,
+      accessRevision,
       queryState.pageIndex,
       queryState.pageSize,
       queryState.sort,
@@ -165,10 +166,11 @@ function TablePageContent({ accountScope, accessChecking, accessRevision }: {
     ],
     queryFn: async ({ signal }) => {
       const result = await listVaultTableRows(vault!, table!, {
-        limit: queryState.pageSize,
+        limit: queryState.pageSize + 1,
         offset: queryState.pageIndex * queryState.pageSize,
         order: tableOrder(queryState.sort),
         filters: queryState.filters.map(compileTableFilter),
+        countExact: false,
         signal,
       });
       return {
@@ -181,12 +183,30 @@ function TablePageContent({ accountScope, accessChecking, accessRevision }: {
     placeholderData: keepPreviousData,
   });
 
+  // Counting is an explicit operation, independent of page navigation. Never
+  // treat the no-count response's page-length `total` as a corpus count.
+  const countQueryKey = ["vault-table-count", vault, table, accountScope, accessRevision, queryState.filters];
+  const countQuery = useQuery({
+    queryKey: countQueryKey,
+    queryFn: ({ queryKey, signal }) => readWithAccessBoundary(queryClient, queryKey, async () => (await listVaultTableRows(vault!, table!, {
+      limit: 0,
+      filters: queryState.filters.map(compileTableFilter),
+      countExact: true,
+      signal,
+    })).total, signal),
+    enabled: false,
+    gcTime: 0,
+    retry: false,
+  });
+
   const catalogDenied = catalogQuery.error instanceof ApiError && [401, 403, 404].includes(catalogQuery.error.status);
   const info: VaultTableInfo | null = catalogDenied ? null :
     catalogQuery.data?.items.find((item) => item.name === table) || null;
-  const rows = rowsQuery.data?.items || [];
+  const displayPageSize = rowsQuery.data?.queryPageSize ?? queryState.pageSize;
+  const rows = rowsQuery.data?.items.slice(0, displayPageSize) || [];
   const cols = rowsQuery.data?.columns || [];
-  const total = rowsQuery.data?.total ?? 0;
+  const total = countQuery.data ?? null;
+  const hasNext = (rowsQuery.data?.items.length ?? 0) > displayPageSize;
   const roleRank = ROLE_RANK[vaultInfoQuery.data?.role as Role] ?? 0;
   const accessRefreshing = accessChecking || (
     !vaultInfoQuery.isError && vaultInfoQuery.data?.queryAccessRevision !== accessRevision
@@ -223,7 +243,11 @@ function TablePageContent({ accountScope, accessChecking, accessRevision }: {
   }, [rowNotice]);
 
   useEffect(() => {
-    if (!rowsQuery.data || rowsQuery.isPlaceholderData) return;
+    // A previously counted total can be stale after concurrent writes. Only
+    // correct an actually empty current page, never discard observed rows or
+    // turn the sentinel response's page length into a corpus count.
+    if (total === null || !rowsQuery.data || rowsQuery.isPlaceholderData
+      || rowsQuery.data.queryPageIndex !== queryState.pageIndex || rowsQuery.data.items.length > 0) return;
     const pageCount = Math.max(1, Math.ceil(total / queryState.pageSize));
     if (queryState.pageIndex < pageCount) return;
     setQueryState({ ...queryState, pageIndex: pageCount - 1 }, true);
@@ -240,14 +264,14 @@ function TablePageContent({ accountScope, accessChecking, accessRevision }: {
     [info?.columns],
   );
 
-  const rowCount = info?.row_count ?? total;
+  // A filtered count is not the number of rows destroyed by deleting a table.
+  const rowCount = queryState.filters.length === 0 ? total ?? undefined : undefined;
   const schemaColumnCount = info?.columns?.length || Math.max(0, cols.length - 4);
   const visibleColumnCount = cols.length || schemaColumnCount;
   const primaryKeyCount = info?.columns?.filter((column) => column.primary_key).length || 0;
   const requiredCount =
     info?.columns?.filter((column) => column.required || column.primary_key).length || 0;
   const displayPageIndex = rowsQuery.data?.queryPageIndex ?? queryState.pageIndex;
-  const displayPageSize = rowsQuery.data?.queryPageSize ?? queryState.pageSize;
   const activeSort = queryState.sort || DEFAULT_TABLE_SORT;
   const availableColumns = Array.from(columnByName.values());
   const queryError = tableRowsError(rowsQuery.error, Boolean(info));
@@ -262,7 +286,13 @@ function TablePageContent({ accountScope, accessChecking, accessRevision }: {
   }
 
   async function refreshTableData() {
+    await resetCount();
     await Promise.all([rowsQuery.refetch(), catalogQuery.refetch()]);
+  }
+
+  async function resetCount() {
+    await queryClient.cancelQueries({ queryKey: ["vault-table-count", vault, table] });
+    await queryClient.resetQueries({ queryKey: ["vault-table-count", vault, table] });
   }
 
   function updatePage(pageIndex: number) {
@@ -294,7 +324,7 @@ function TablePageContent({ accountScope, accessChecking, accessRevision }: {
             <div className="hidden shrink-0 items-center gap-3 text-xs text-foreground-muted xl:flex">
               <span className="inline-flex items-center gap-1.5 whitespace-nowrap tabular-nums">
                 <Rows3 className="h-3.5 w-3.5" aria-hidden />
-                {rowCount} rows
+                {rowCount === undefined ? "Row total not counted" : `${rowCount.toLocaleString()} ${rowCount === 1 ? "row" : "rows"} counted`}
               </span>
               <span className="inline-flex items-center gap-1.5 whitespace-nowrap tabular-nums">
                 <Columns3 className="h-3.5 w-3.5" aria-hidden />
@@ -599,12 +629,19 @@ function TablePageContent({ accountScope, accessChecking, accessRevision }: {
                   </table>
                 </div>
               )}
-              {rowsQuery.data && total > 0 && (
+              {countQuery.isError && (
+                <Alert variant="destructive">Could not count rows. Use Count rows to retry; record browsing is still available.</Alert>
+              )}
+              {rowsQuery.data && (
                 <TablePagination
                   pageIndex={displayPageIndex}
                   pageSize={displayPageSize}
                   total={total}
                   itemCount={rows.length}
+                  hasNext={hasNext}
+                  busy={rowsQuery.isFetching}
+                  counting={countQuery.isFetching}
+                  onCountRows={() => void countQuery.refetch()}
                   onPageChange={updatePage}
                   onPageSizeChange={updatePageSize}
                 />
@@ -793,6 +830,7 @@ function TablePageContent({ accountScope, accessChecking, accessRevision }: {
               setQueryState({ ...queryState, pageIndex: 0 }, true);
             }
           }
+          await resetCount();
           await Promise.all([
             queryClient.invalidateQueries({ queryKey: ["vault-table-rows", vault, table] }),
             queryClient.invalidateQueries({ queryKey: ["vault-tables", vault] }),
@@ -830,6 +868,7 @@ function TablePageContent({ accountScope, accessChecking, accessRevision }: {
             if (!latest) {
               setRowNotice("Row was already deleted");
               setRowToDelete(null);
+              await resetCount();
               await queryClient.invalidateQueries({
                 queryKey: ["vault-table-rows", vault, table],
               });
@@ -841,6 +880,7 @@ function TablePageContent({ accountScope, accessChecking, accessRevision }: {
               { cause: caught },
             );
           }
+          await resetCount();
           await Promise.all([
             queryClient.invalidateQueries({ queryKey: ["vault-table-rows", vault, table] }),
             queryClient.invalidateQueries({ queryKey: ["vault-tables", vault] }),

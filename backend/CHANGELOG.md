@@ -16,6 +16,7 @@ specifically; the proxy has its own log in
   `grep_scope_too_large` error for protective scope rejections. Search and MCP
   help distinguish candidate limits, returned previews, client byte budgets
   and service failures. See the [large-Vault navigation guide](../docs/operations/large-vault-navigation.md).
+
 ### Reliability
 
 - Return sanitized `503` dependency/timeout errors consistently over REST
@@ -27,6 +28,7 @@ specifically; the proxy has its own log in
 - Bound readiness DB initialization and ping together, preserve the successful
   30-second readiness cache and soft vector-store check, and omit connection
   details from public probe errors. See `docs/operations/database-recovery.md`.
+
 ### Search
 
 - The bundled PostgreSQL image applies VChord-BM25's existing snapshot and SQL
@@ -37,6 +39,18 @@ specifically; the proxy has its own log in
   operator prefilter opt-out, ranking, timeouts, and ACL enforcement remain
   unchanged. Deploy the rebuilt PostgreSQL image to apply this fix; a backend
   restart alone is insufficient. No index rebuild or data migration is needed.
+
+### Performance
+
+- Bound routine Table browsing to a page plus one row, with an explicit exact
+  count action and a schema-only catalog option. Existing counted API defaults
+  and row/ACL contracts are unchanged; unknown counts are no longer rendered
+  as zero in Table deletion warnings. A denied recount discards the previous
+  count snapshot so a later transient failure cannot restore denied metadata.
+- Index live document updates and the default stable Table page order, including
+  existing registered tables (migrations 117–118). This avoids catalog-wide
+  sorting and large-table sorts during ordinary navigation. Initial index builds
+  can block writes; schedule large upgrades accordingly.
 
 ### Fixed
 

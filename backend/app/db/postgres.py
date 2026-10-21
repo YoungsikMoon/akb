@@ -412,6 +412,11 @@ async def _apply_pending_migrations(conn, applied: set[str]) -> None:
         "116_publication_password_budgets.py",  # shared password-attempt accounting across API replicas
         "117_native_recent_order.py",  # newest-first live document feed, without a catalog-wide sort
         "118_table_page_order.py",  # default stable table pages use an ordered index, not a full-table sort
+        "121_sso_identity_operations.py",  # exact short-lived migration authority and provider ownership
+        "122_sso_management_targets.py",
+        "123_sso_callback_evidence.py",
+        "124_prepared_sso_targets.py",  # adopt an explicitly prepared target without replacing source history
+        "125_sso_operation_attempts.py",
     ):
         if filename in applied:
             continue

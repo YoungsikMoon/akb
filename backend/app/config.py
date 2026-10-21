@@ -546,6 +546,10 @@ class ExternalGitHostRule(BaseModel):
 
 
 class Settings(BaseModel):
+    # Protected installation-owned JSON; never registered through HTTP.
+    sso_management_targets_file: str = ""
+    sso_prepared_target_id: str = ""
+
     notifications_enabled: bool = True
     notification_retention_days: int = Field(default=90, ge=1, le=3650)
     # Forbid unknown keys so a typo in app.yaml / secret.yaml fails loudly

@@ -47,6 +47,7 @@ from app.services.user_sql_executor import (
     PermissionDeniedError,
     UniqueViolationError,
     get_user_sql_executor,
+    human_admin_sql_bypass,
 )
 from app.util.errors import (
     err,
@@ -1938,9 +1939,10 @@ async def execute_sql(
       - Single vault: 'pipeline' → 'vt_sales__pipeline'
       - Cross-vault: 'sales__pipeline' → 'vt_sales__pipeline'
 
-    System admins (``users.is_admin = TRUE``) bypass the per-user PG
+    Human system admins (``users.is_admin = TRUE``) bypass the per-user PG
     role and run as the backend service role — matching the existing
-    system-admin trust model. For everyone else, PG is the authority.
+    human system-admin trust model. For service accounts and other users, PG
+    is the authority.
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -2029,7 +2031,8 @@ async def execute_sql(
                     vrow["id"], token_id, conn=conn,
                 ):
                     continue
-                if is_admin and current_vault_scope.get() is None:
+                if (current_vault_scope.get() is None
+                        and await human_admin_sql_bypass(conn, user_id, is_admin)):
                     # A3: bypass, but LOUDLY — same event as the guard.
                     await emit_event(
                         conn, "vault.write_policy_admin_bypass",

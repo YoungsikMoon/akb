@@ -340,6 +340,11 @@ jobs:
             tests/test_pat_issuance_postgres.py
             tests/test_admin_auth_postgres.py
             tests/test_sso_identity_migration_postgres.py
+            tests/test_sso_migration_actor_postgres.py
+            tests/test_sso_identity_operations_postgres.py
+            tests/test_sso_management_targets_postgres.py
+            tests/test_sso_callback_evidence_postgres.py
+            tests/test_sso_operation_attempts_postgres.py
             tests/test_pending_admission_postgres.py
             tests/test_edge_vault_boundary_postgres.py
             tests/test_workspace_external_identity.py

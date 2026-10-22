@@ -198,7 +198,7 @@ function DocumentPageContent({
     setLeavingEditor(false);
   }, [active, routeLocation.key]);
   const editorMenuDismissRef = useRef<(() => void) | null>(null);
-  const navigationFocusRef = useRef<HTMLElement | null>(null);
+  const navigationFocusRef = useRef<HTMLDivElement | null>(null);
   const [pendingExistingPath, setPendingExistingPath] = useState<string | null>(null);
   const [override, setOverride] = useState<{ scope: string; value: any } | null>(null);
   const docOverride = override?.scope === resourceScope ? override.value : null;
@@ -242,7 +242,7 @@ function DocumentPageContent({
     if (!input) return;
     // Start the document form at its title. Body autofocus can scroll this
     // field behind the command row, especially in a short viewport.
-    const canvas = input.closest("main");
+    const canvas = input.closest<HTMLElement>("#document-reading-canvas");
     if (canvas) canvas.scrollTop = 0;
     input.focus({ preventScroll: true });
   }, []);
@@ -1719,7 +1719,9 @@ function DocumentPageContent({
         )}
 
         <div className="relative flex min-h-0 flex-1 overflow-hidden">
-          <main
+          {/* The app shell's <main id="main"> is the page's only main landmark;
+              this scrolling canvas stays a focusable region inside it. */}
+          <div
             ref={navigationFocusRef}
             id="document-reading-canvas"
             tabIndex={-1}
@@ -1955,7 +1957,7 @@ function DocumentPageContent({
                 />
               )}
             </article>
-          </main>
+          </div>
 
           {!inEditMode && (
             <DocumentContextPanel id={`${viewId}-details`} open={detailsOpen}

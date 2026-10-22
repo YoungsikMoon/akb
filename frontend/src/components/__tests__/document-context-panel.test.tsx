@@ -12,7 +12,7 @@ function ContextHarness() {
   const [editing, setEditing] = useState(false);
   const triggerRef = useRef<HTMLButtonElement>(null);
   return <div data-testid="reader-layout">
-    <main id="document-reading-canvas"><h2 id="article-heading">Article heading</h2><button type="button" onClick={() => setActions(n => n + 1)}>Article action</button><output aria-label="Actions performed">{actions}</output></main>
+    <div id="document-reading-canvas" tabIndex={-1}><h2 id="article-heading">Article heading</h2><button type="button" onClick={() => setActions(n => n + 1)}>Article action</button><output aria-label="Actions performed">{actions}</output></div>
     <button ref={triggerRef} type="button" aria-label="Document details" aria-controls="reader-details" aria-expanded={open} onClick={() => setOpen(!open)}>Details</button>
     <DocumentContextPanel id="reader-details" open={open} onOpenChange={setOpen} view={view} onViewChange={setView} triggerRef={triggerRef}
       outline={<><p>outline content</p><a href="#article-heading">Jump to article heading</a></>}

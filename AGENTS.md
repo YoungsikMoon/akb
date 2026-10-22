@@ -2,39 +2,34 @@
 
 ## Coding agent workflow
 
-Both coding agents run the same roles. They are defined once in
-`.agents/roles.toml`; `.codex/` and `.claude/` are rendered from it by
-`scripts/agent-roles.py`, and `scripts/check.sh` fails when a rendered file is
-hand-edited or stale. Model names live only in that source. `CLAUDE.md`
-imports this file, so this is the one contract.
+This file is the instruction file for every coding agent and for people working
+in this repository. Claude Code and Codex both read `AGENTS.md` directly; there
+is no separate per-agent instruction file.
 
-| role | effort | scope |
-| --- | --- | --- |
-| owner (the session default) | `medium`, raised per task | architecture, consequential review, uncertain cross-repository decisions |
-| `explorer` | `max` only | optional bounded read-only lookup: paths and evidence, not decisions |
-| `reviewer` | `high` | read-only review of a named diff with reproducible findings |
-| `efficiency_worker` | `medium` | opt-in implementation, only with evidence of better total efficiency |
-
-- Start on the owner model at the configured `medium` effort. Increase to
-  `high`, `xhigh`, or `max` when the problem or observed result warrants it.
-  These settings concern the coding agent, not product models.
-- The explorer tier is allowed only at `max`, for a bounded auxiliary task.
-  Choose the worker tier only when comparable work has demonstrated adequate
-  quality and better total efficiency than the owner; include latency,
-  retries, and usage in that judgment. Otherwise keep the task on the owner.
-- Carry out the requested outcome using reasonable assumptions. Existing user
-  authorization continues to apply; local skills do not create new approval
-  steps. If an actual instruction blocks progress, cite its file and wording.
-- Delegate independent work when it saves time while the owner makes useful
-  progress: one level deep, at most three workers at a time, each with clear
-  paths, scope, and a check; integrate once. A review or implementation task
-  does not require a fixed agent pipeline.
-- Read only the applicable product and directory guidance. Run checks that
-  exercise the changed behavior and required repository gates; documentation
-  or agent-configuration edits need parsing, links, and relevant policy checks.
-  Repeat a passing check only for a changed input or a specific unresolved risk.
-- Report the result, evidence, and remaining limitation in concise prose.
-  Preserve unrelated local work and keep credentials out of tracked files.
+- **Model and effort are each person's choice.** Nothing in this repository
+  sets a coding-agent model or reasoning effort; Claude Code and Codex use
+  whatever you configured. Product inference models (`embed_model`,
+  `llm_model` in `config/app.yaml`) are a separate, product-level setting.
+- **Helper roles** are optional and defined once in `.agents/roles.toml`:
+  `explorer` and `reviewer` are read-only, `worker` makes bounded edits.
+  `.codex/` and `.claude/agents/` are rendered from that file by
+  `python scripts/agent-roles.py`; edit the source, never a rendered file.
+  `scripts/check.sh` fails on a hand-edited or stale rendered file and on any
+  model or effort key in the source or in `.claude/settings.json`.
+- **Verify before saying something passes.** `bash scripts/check.sh` is the
+  static gate CI runs; its tool setup is in the Static Analysis Gate section
+  of `CONTRIBUTING.md`, and it names any missing prerequisite. Also run the
+  checks that exercise what you changed: the frontend gate below for UI work,
+  the suites in `scripts/ci/README.md` for backend behavior. Report what ran
+  and its result, and say so when a check was not run.
+- **Do not break the contracts below** (proxy-only filesystem tools, the doc
+  ID lookup, the indexing write path's crash-safe ordering, release tag
+  prefixes). A change to one updates its section here in the same pull request.
+  Preserve unrelated local work.
+- **This repository is public.** Code, comments, docs, commit messages and
+  pull-request text must not contain internal hostnames, private planning
+  references, credentials, or references to internal issue trackers. Explain
+  the reason in self-contained prose instead of pointing at private material.
 
 ## Architecture
 

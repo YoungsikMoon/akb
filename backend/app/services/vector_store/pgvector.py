@@ -1123,7 +1123,7 @@ class PgvectorStore:
         else:
             filter_uuids = None
             filter_col = "source_id"  # unused when filter_uuids is None
-        # source_types (workbench #1069) is orthogonal to the ACL filter: it
+        # source_types is orthogonal to the ACL filter: it
         # ANDs with whichever of vault_ids / source_ids is present (or with no
         # filter at all). Values are driver-owned discriminators, never user
         # input — validate against the known set so a caller typo fails loud
@@ -1452,7 +1452,7 @@ class PgvectorStore:
         if not terms:
             return []
 
-        # source_type predicate (workbench #1069), orthogonal to the ACL
+        # source_type predicate, orthogonal to the ACL
         # filter. In filtered branches it ANDs onto the existing WHERE; in
         # unfiltered branches it becomes the WHERE. Each branch below spells
         # its own bind numbering. Values are driver-owned discriminators

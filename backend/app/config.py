@@ -905,8 +905,8 @@ class Settings(BaseModel):
     # caller (MCP, REST, internal) is bounded uniformly.
     search_limit_max: int = Field(default=50, ge=1)
 
-    # Cap on the caller-supplied `source_uris` scope list (workbench #1069,
-    # part 3). Each URI expands into SQL OR-clauses (candidate scope) and a
+    # Cap on the number of caller-supplied `source_uris` in one search
+    # request. Each URI expands into SQL OR-clauses (candidate scope) and a
     # vector-store IN-list entry, so an unbounded list lets one request grow
     # the query text and the downstream filter payload without bound (the
     # seahorse drivers have overflowed on giant IN lists before). 200 is a

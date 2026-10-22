@@ -326,6 +326,29 @@ function renderPreviewAt(url: string) {
   );
 }
 
+// The application shell renders every routed page inside its one
+// `<main id="main">`, the skip-link and navigation focus target.
+function renderInShellAt(url: string) {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return render(
+    <QueryClientProvider client={qc}>
+      <MemoryRouter initialEntries={[url]}>
+        <CurrentUserProvider user={CURRENT_USER}>
+          <VaultRefreshProvider refetchVaults={vi.fn()} refetchTree={vi.fn()}>
+            <ResourceNavigationProvider>
+              <main id="main" tabIndex={-1}>
+                <Routes>
+                  <Route path="/vault/:name/doc/:id" element={<DocumentPage />} />
+                </Routes>
+              </main>
+            </ResourceNavigationProvider>
+          </VaultRefreshProvider>
+        </CurrentUserProvider>
+      </MemoryRouter>
+    </QueryClientProvider>,
+  );
+}
+
 async function openDocumentDetails(user: ReturnType<typeof userEvent.setup>, section?: "Properties" | "Version history" | "Related documents") {
   // A saved authoring dialog can still be leaving while reading resumes. Only
   // the reader's inspector owns these disclosures, even when the names match.
@@ -2216,4 +2239,38 @@ it("does not resurrect a denied document after a later transient error", async (
   getDocumentMock.mockResolvedValue(makeDoc({ title: "Fresh document" }));
   await userEvent.setup().click(screen.getByRole("button", { name: "Retry document" }));
   expect(await screen.findByRole("heading", { name: "Fresh document", level: 1 })).toBeInTheDocument();
+});
+
+describe("DocumentPage landmarks", () => {
+  it("reads inside the shell's only main landmark and keeps the canvas focusable", async () => {
+    renderInShellAt("/vault/v/doc/notes%2Fhello.md");
+    await screen.findByRole("heading", { name: "DocTitle", level: 1 });
+    expect(screen.getAllByRole("main")).toHaveLength(1);
+    const main = screen.getByRole("main");
+    expect(main).toHaveAttribute("id", "main");
+    const canvas = document.getElementById("document-reading-canvas");
+    expect(main).toContainElement(canvas);
+    act(() => canvas?.focus());
+    expect(canvas).toHaveFocus();
+  });
+
+  it("adds no main landmark of its own as a route preview", async () => {
+    renderPreviewAt("/vault/v/doc/notes%2Fhello.md");
+    await screen.findByRole("heading", { name: "DocTitle", level: 1 });
+    expect(screen.queryAllByRole("main")).toHaveLength(0);
+  });
+
+  it("starts editing at the top of the reading canvas", async () => {
+    const user = userEvent.setup();
+    getVaultInfoMock.mockResolvedValue({ role: "writer" });
+    renderInShellAt("/vault/v/doc/notes%2Fhello.md");
+    const edit = await screen.findByRole("button", { name: "Edit" });
+    const canvas = document.getElementById("document-reading-canvas");
+    if (!canvas) throw new Error("Missing reading canvas");
+    canvas.scrollTop = 480;
+    await user.click(edit);
+    await waitFor(() => expect(screen.getByRole("textbox", { name: "Document title" })).toHaveFocus());
+    expect(document.getElementById("document-reading-canvas")).toBe(canvas);
+    expect(canvas.scrollTop).toBe(0);
+  });
 });

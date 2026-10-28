@@ -109,6 +109,16 @@ specifically; the proxy has its own log in
   OpenAPI response contract. Declared enum values, table data, constraints,
   and drift reporting are unchanged.
 
+### Documents
+
+- **Breaking:** whole-body document updates, including empty bodies and proxy
+  `file` input, now require `expected_commit` or `expected_content_hash` from
+  the original read. Both supplied conditions must match. Metadata-only
+  patches and exact-text edits retain their separate contracts. Empty,
+  malformed and normalized-away version tokens are rejected. REST, MCP,
+  help and SDK types describe the same rules; MCP rejects invalid input
+  without echoing the rejected body. See `docs/operations/document-write-preconditions.md`.
+
 ## 0.17.0 — 2026-10-19
 
 ### Accounts

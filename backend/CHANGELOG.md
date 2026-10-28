@@ -54,6 +54,23 @@ specifically; the proxy has its own log in
 
 ### Fixed
 
+- File replacement upload capabilities now write to their own staging object
+  instead of being mistaken for a confirmed-file replay. Obsolete original
+  upload capabilities are rejected after a replacement, and every confirmation
+  uses a fresh candidate so retries cannot overwrite or delete published bytes.
+- Ordinary upload confirmation now transitions only the inspected pending
+  reservation. Replays of confirmed Files return current metadata or a
+  non-destructive hash conflict, and browser upload failures no longer issue a
+  general File DELETE. Collection cascades lock current File rows before
+  enqueueing object cleanup, preventing a concurrent replacement from leaking
+  its newly published object.
+- The S3 delete worker periodically inventories the private replacement-staging
+  prefix, so an accepted upload completing after its original cleanup is
+  rediscovered. The existing outbox still performs deletion; no timeout or
+  upload-grant lifetime is increased. See
+  [file-storage cleanup](../docs/operations/file-storage-cleanup.md) for the
+  prefix-list permission and retention boundaries.
+
 - Password-protected publications now share their attempt budget across API
   replicas and process restarts. PostgreSQL atomically reserves each attempt
   before verification; per-IP and publication-wide backoff retain their

@@ -15,7 +15,7 @@ import logging
 import uuid
 from dataclasses import replace
 from datetime import UTC, datetime
-from typing import NoReturn
+from typing import Any, NoReturn
 from app.services.role_authority import role_authority_transaction
 from app.services.search_filters import ArchiveScope
 
@@ -52,9 +52,8 @@ from app.repositories.native_revision_repo import (
     NativeRevisionRepository,
     NativeRevisionSelectorAmbiguousError,
 )
-from app.repositories.vault_files_repo import DocumentAssetOwner
 from app.repositories.vault_repo import VaultRepository
-from app.services import asset_service, document_counters, skill_policy
+from app.services import document_counters, skill_policy
 from app.services.document_service import (
     EditError,
     DocumentService,
@@ -325,10 +324,17 @@ class NativeDocumentService(DocumentService):
 
     async def _legacy_projection_rows(
         self, vault_id: uuid.UUID, resource_ids: list[uuid.UUID],
+        *, conn: asyncpg.Connection | None = None,
     ) -> dict[uuid.UUID, dict]:
         """Batch form of the ``_document_frontmatter`` legacy read."""
         if not resource_ids:
             return {}
+        if conn is not None:
+            rows = await conn.fetch(
+                "SELECT id, title, doc_type, status, summary, domain, created_by, created_at, updated_at, tags "
+                "FROM documents WHERE vault_id = $1 AND id = ANY($2::uuid[])", vault_id, resource_ids,
+            )
+            return {row["id"]: dict(row) for row in rows}
         pool = await self._pool()
         async with pool.acquire() as conn:
             rows = await conn.fetch(
@@ -651,121 +657,6 @@ class NativeDocumentService(DocumentService):
             metadata_is_current=selected.revision_id != current.revision_id,
         )
 
-    @staticmethod
-    def _mentions_assets(*bodies: str | None) -> bool:
-        """Whether any of these bodies can possibly reference an image.
-
-        A document that names no asset URL now and named none before cannot
-        have a live reference, so the claim and the sync are both skippable —
-        and most documents are that document. Without this every Native write
-        would pay a pool acquisition and a DELETE for nothing.
-        """
-        prefix = asset_service.ASSET_URL_PREFIX
-        return any(body and prefix in body.lower() for body in bodies)
-
-    async def _claim_body_assets(
-        self,
-        vault_id: uuid.UUID,
-        markdown: str,
-        *,
-        strict: bool,
-        previous_markdown: str | None = None,
-    ) -> set[uuid.UUID]:
-        """Validate and claim a body's inline images BEFORE the revision write.
-
-        The Git arm claims inside the document's own transaction, so a rejected
-        claim rolls the write back. The Native revision service owns its
-        transaction and exposes a connection only for `create_text_in_conn`,
-        never for replace/move/delete, so the claim runs first here instead.
-
-        Ordering carries the two guarantees the shared transaction gave:
-        a strict failure raises before any revision exists, and claiming is
-        itself the lock against a concurrent discard, because
-        `delete_unclaimed_attachment` only ever removes a row whose
-        `attachment_claimed_at` is still NULL.
-
-        What the split gives up is atomicity in the other direction: a write
-        that fails after a successful claim leaves the asset claimed and
-        unreferenced. `asset_gc_worker` already collects exactly that shape —
-        confirmed, claimed, and named by no live or retained reference.
-        """
-        pool = await self._pool()
-        async with pool.acquire() as conn, conn.transaction():
-            return await asset_service.claim_document_assets(
-                conn,
-                vault_id=vault_id,
-                markdown=markdown,
-                strict=strict,
-                previous_markdown=previous_markdown,
-            )
-
-    async def _sync_body_assets(
-        self,
-        *,
-        vault_id: uuid.UUID,
-        resource_id: uuid.UUID,
-        path: str,
-        revision_id: str,
-        asset_ids: set[uuid.UUID],
-        previous_revision: str | None = None,
-        previous_path: str | None = None,
-    ) -> None:
-        """Publish the live image set for a Native document.
-
-        A reference is what makes an image readable, so this is the step whose
-        absence left every Native-era inline upload broken.  It is deliberately
-        not fatal: the revision is already durable, and failing the caller here
-        would report a write that actually succeeded.  The next write to the
-        document re-syncs from the body.
-        """
-        try:
-            pool = await self._pool()
-            async with pool.acquire() as conn, conn.transaction():
-                await asset_service.sync_document_assets(
-                    conn,
-                    owner=DocumentAssetOwner(
-                        vault_id=vault_id, native_document_id=resource_id,
-                    ),
-                    document_path=path,
-                    commit_hash=revision_id,
-                    asset_ids=asset_ids,
-                    previous_commit=previous_revision,
-                    previous_path=previous_path,
-                )
-        except Exception:  # noqa: BLE001 — the revision is already committed
-            logger.exception(
-                "Native document asset refs not synced for %s@%s", path, revision_id[:8],
-            )
-
-    async def _retain_body_assets_for_delete(
-        self,
-        *,
-        vault_id: uuid.UUID,
-        resource_id: uuid.UUID,
-        path: str,
-        revision_id: str,
-    ) -> None:
-        """Keep a deleted document's last image-bearing revision readable.
-
-        `delete_resource` only sets `lifecycle = 'deleted'`, so the live
-        reference is dropped by the trigger migration 107 installs rather than
-        by a row cascade. Extending the historical manifest first is what keeps
-        a `?commit=` read of the last revision working through its retention
-        window, exactly as the Git arm does before its row is removed.
-        """
-        try:
-            pool = await self._pool()
-            async with pool.acquire() as conn, conn.transaction():
-                await asset_service.retain_document_assets_for_delete(
-                    conn,
-                    owner=DocumentAssetOwner(
-                        vault_id=vault_id, native_document_id=resource_id,
-                    ),
-                    document_path=path,
-                    commit_hash=revision_id,
-                )
-        except Exception:  # noqa: BLE001 — never block a delete on retention
-            logger.exception("Native document asset retention failed for %s", path)
 
     async def put(
         self,
@@ -819,14 +710,6 @@ class NativeDocumentService(DocumentService):
         if agent_id:
             frontmatter["created_by"] = agent_id
         raw = _compose_markdown(frontmatter, req.content)
-        # Claim before the revision exists: a body naming an image this vault
-        # cannot serve must not become a document (see `_claim_body_assets`).
-        carries_assets = self._mentions_assets(req.content)
-        asset_ids: set[uuid.UUID] = set()
-        if carries_assets:
-            asset_ids = await self._claim_body_assets(
-                vault_id, req.content, strict=not allow_unavailable_asset_refs,
-            )
         actor = agent_id or "unknown"
         mutation_id = uuid.uuid4()
         race_count = 0
@@ -844,6 +727,7 @@ class NativeDocumentService(DocumentService):
                     message=message,
                     subject=f"[put] {final_path}",
                     summary=req.title,
+                    allow_unavailable_asset_refs=allow_unavailable_asset_refs,
                 )
                 break
             except ConflictError as exc:
@@ -857,14 +741,6 @@ class NativeDocumentService(DocumentService):
                     path_identity,
                     aliases_own_path=False,
                 )
-        if carries_assets:
-            await self._sync_body_assets(
-                vault_id=vault_id,
-                resource_id=result.resource_id,
-                path=result.path,
-                revision_id=result.revision_id,
-                asset_ids=asset_ids,
-            )
         content_hash = _certified_content_hash(raw)
         await self._register_collection(vault_id, final_path)
         return DocumentPutResponse(
@@ -1068,14 +944,6 @@ class NativeDocumentService(DocumentService):
             actor = agent_id or "unknown"
             summary = req.message or f"Update {current.path}"
             message = f"[update] {current.path}\n\nagent: {actor}\naction: update\nsummary: {summary}"
-            # The previous body counts too: dropping the last image from a
-            # document is what removes its reference.
-            touches_assets = self._mentions_assets(new_body, current_body)
-            asset_ids: set[uuid.UUID] = set()
-            if touches_assets:
-                asset_ids = await self._claim_body_assets(
-                    vault_id, new_body, strict=False, previous_markdown=current_body,
-                )
             try:
                 result = await native.replace_text(
                     namespace_id=vault_id,
@@ -1108,15 +976,6 @@ class NativeDocumentService(DocumentService):
                     resource_id=resource_id,
                 )
                 continue
-            if touches_assets:
-                await self._sync_body_assets(
-                    vault_id=vault_id,
-                    resource_id=result.resource_id,
-                    path=result.path,
-                    revision_id=result.revision_id,
-                    asset_ids=asset_ids,
-                    previous_revision=result.parent_revision_id,
-                )
             if current.path == skill_policy.VAULT_SKILL_PATH:
                 from app.services import vault_skill_service
                 vault_skill_service.invalidate(vault)
@@ -1236,28 +1095,6 @@ class NativeDocumentService(DocumentService):
             )
             _, body = _parse_markdown(committed.text)
             break
-        # A move changes the path, not the body, so the live set is carried
-        # over unchanged; the previous path/revision is what gives the old
-        # HEAD its retention window. A body naming no image has no live set to
-        # carry, so the same short-circuit as the other write paths applies.
-        if self._mentions_assets(body):
-            move_owner = DocumentAssetOwner(
-                vault_id=vault_id, native_document_id=result.resource_id,
-            )
-            pool = await self._pool()
-            async with pool.acquire() as conn:
-                live_asset_ids = await asset_service.list_live_document_asset_ids(
-                    conn, owner=move_owner,
-                )
-            await self._sync_body_assets(
-                vault_id=vault_id,
-                resource_id=result.resource_id,
-                path=result.path,
-                revision_id=result.revision_id,
-                asset_ids=live_asset_ids,
-                previous_revision=result.parent_revision_id,
-                previous_path=current.path,
-            )
         await self._relink_moved_edges(
             vault_id, vault, old_path=current.path, new_path=result.path,
             resource_id=result.resource_id,
@@ -1373,12 +1210,6 @@ class NativeDocumentService(DocumentService):
         resource_id = current.resource_id
         native = await self._native()
         actor = agent_id or "unknown"
-        await self._retain_body_assets_for_delete(
-            vault_id=vault_id,
-            resource_id=resource_id,
-            path=current.path,
-            revision_id=current.revision_id,
-        )
         race_count = 0
         while True:
             try:
@@ -1474,6 +1305,8 @@ class NativeDocumentService(DocumentService):
         max_depth: int,
         include_hashes: bool,
         include_archived: bool,
+        resource_ids: list[uuid.UUID] | None = None,
+        conn: asyncpg.Connection | None = None,
     ) -> list[BrowseItem]:
         """Read current Native document Heads for the public browse view.
 
@@ -1484,11 +1317,17 @@ class NativeDocumentService(DocumentService):
         """
         depth_offset = prefix.count("/") + 1 if prefix else 0
         native = await self._native()
+        bounded: dict[str, Any] = {}
+        if resource_ids is not None:
+            bounded["resource_ids"] = resource_ids
+        if conn is not None:
+            bounded["conn"] = conn
         snapshots = await native.list_live_head_snapshots(
             namespace_id=vault_id,
             surface="document",
             path_like=like_escape(prefix) + "/%" if prefix else None,
             max_slashes=max_depth + depth_offset if max_depth >= 0 else None,
+            **bounded,
         )
         # Parsing every body is CPU-bound; keep it off the event loop.
         parsed = await asyncio.to_thread(lambda: [_parse_markdown(s.text) for s in snapshots])
@@ -1496,7 +1335,7 @@ class NativeDocumentService(DocumentService):
             snapshot.resource_id
             for snapshot, (frontmatter, _) in zip(snapshots, parsed, strict=True)
             if not self._has_complete_native_frontmatter(frontmatter)
-        ])
+        ], **({"conn": conn} if conn is not None else {}))
         items: list[BrowseItem] = []
         for snapshot, (frontmatter, body) in zip(snapshots, parsed, strict=True):
             if snapshot.resource_id in legacy:
@@ -1616,9 +1455,22 @@ class NativeDocumentService(DocumentService):
         include_hashes: bool = False,
         include_archived: bool = False,
         archive_scope: ArchiveScope | None = None,
+        page_size: int | None = None,
+        cursor: str | None = None,
+        name_query: str | None = None,
     ) -> BrowseResponse:
         """Return the legacy browse envelope with Native document Heads."""
         from app.services.search_filters import resolve_archive_scope, status_matches
+
+        if page_size is not None or cursor is not None or name_query is not None or content_type in ("collections", "resources"):
+            from app.services.browse_pages import browse_page
+
+            return await browse_page(
+                self, await self._pool(), vault, native=True, collection=collection, depth=depth,
+                content_type=content_type, include_hashes=include_hashes,
+                include_archived=include_archived, archive_scope=archive_scope,
+                page_size=page_size if page_size is not None else 100, cursor=cursor, name_query=name_query,
+            )
 
         scope = resolve_archive_scope(archive_scope, include_archived)
         include_archived = scope != "unarchived"
